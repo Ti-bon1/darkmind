@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "name": "Xmind",
+  "request": "то же но вырезать всякую ненужную опции лишние шаблоны все упростить",
+  "target": {
+    "kind": "local",
+    "path": "/Applications/Xmind.app"
+  },
+  "stack": "Rust + egui (eframe)",
+  "status": "ready",
+  "note": "Ready: you called it done. Everything so far is kept; a new message carries on from here.",
+  "created_ms": 1793983456820,
+  "updated_ms": 1793983550320,
+  "checks": [],
+  "agent_session": null,
+  "agent_session_by": "opencode",
+  "allowed_actions": [],
+  "last_reply": "",
+  "asset_budget_usd": 5.0,
+  "generate_assets": false,
+  "app_in_root": true,
+  "start_files": [
+    ".DS_Store",
+    "mindmap.rs",
+    "mindmap_rust"
+  ],
+  "questions": "decide"
+}

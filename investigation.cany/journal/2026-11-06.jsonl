@@ -1,0 +1,6 @@
+{"caller":"ui","duration_ms":1528,"kind":"tool_call","ok":true,"params":{},"time":"2026-11-06T16:44:20Z","tool":"project_pins_list","ts":1793983460}
+{"caller":"ui","duration_ms":0,"kind":"tool_call","ok":true,"params":{},"time":"2026-11-06T16:44:20Z","tool":"project_pins_list","ts":1793983460}
+{"caller":"ui","duration_ms":27,"kind":"tool_call","ok":true,"params":{"mode":"ask","project":"/Users/aleksandrglok/Desktop/раст майнд мап "},"time":"2026-11-06T16:45:16Z","tool":"project_questions_set","ts":1793983516}
+{"caller":"ui","duration_ms":19,"kind":"tool_call","ok":true,"params":{"mode":"decide","project":"/Users/aleksandrglok/Desktop/раст майнд мап "},"time":"2026-11-06T16:45:19Z","tool":"project_questions_set","ts":1793983519}
+{"caller":"ui","duration_ms":0,"kind":"tool_call","ok":true,"params":{},"time":"2026-11-06T16:45:40Z","tool":"project_pins_list","ts":1793983540}
+{"caller":"ui","duration_ms":11,"kind":"tool_call","ok":true,"params":{"project":"/Users/aleksandrglok/Desktop/раст майнд мап "},"time":"2026-11-06T16:45:50Z","tool":"project_build_finish","ts":1793983550}
