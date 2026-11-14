@@ -14,19 +14,11 @@ use printpdf::{
     Pt as PdfPt, Rect as PdfRect, Rgb as PdfRgb, TextItem, WindingOrder,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------- palette ---
 
-const NAVY: Color32 = Color32::from_rgb(35, 45, 63);
-const NAVY_HOVER: Color32 = Color32::from_rgb(52, 65, 87);
-const TEXT: Color32 = Color32::from_rgb(43, 48, 58);
-const MUTED: Color32 = Color32::from_rgb(122, 130, 143);
-const CANVAS: Color32 = Color32::from_rgb(247, 248, 250);
-const BORDER: Color32 = Color32::from_rgb(231, 234, 240);
-const SOFT: Color32 = Color32::from_rgb(240, 242, 246);
 const WHITE: Color32 = Color32::WHITE;
-const ACCENT: Color32 = Color32::from_rgb(66, 99, 235);
 
 const BRANCH: [Color32; 5] = [
     Color32::from_rgb(89, 132, 233),
@@ -38,6 +30,139 @@ const BRANCH: [Color32; 5] = [
 
 const V_GAP: f32 = 18.0;
 const BRANCH_GAP: f32 = 28.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn toggled(self) -> Self {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+
+    fn egui(self) -> egui::Theme {
+        match self {
+            Theme::Light => egui::Theme::Light,
+            Theme::Dark => egui::Theme::Dark,
+        }
+    }
+}
+
+/// Цвета интерфейса и карты. Отдельные значения для светлой и тёмной темы.
+#[derive(Clone, Copy)]
+struct Palette {
+    canvas: Color32,
+    panel: Color32,
+    border: Color32,
+    soft: Color32,
+    text: Color32,
+    heading: Color32,
+    muted: Color32,
+    accent: Color32,
+    on_color: Color32,
+    navy: Color32,
+    navy_hover: Color32,
+    dot: Color32,
+    icon: Color32,
+    icon_disabled: Color32,
+    zoom_icon: Color32,
+    branches: [Color32; 5],
+    dark: bool,
+}
+
+impl Palette {
+    fn light() -> Self {
+        Self {
+            canvas: Color32::from_rgb(247, 248, 250),
+            panel: WHITE,
+            border: Color32::from_rgb(231, 234, 240),
+            soft: Color32::from_rgb(240, 242, 246),
+            text: Color32::from_rgb(43, 48, 58),
+            heading: Color32::from_rgb(35, 45, 63),
+            muted: Color32::from_rgb(122, 130, 143),
+            accent: Color32::from_rgb(66, 99, 235),
+            on_color: WHITE,
+            navy: Color32::from_rgb(35, 45, 63),
+            navy_hover: Color32::from_rgb(52, 65, 87),
+            dot: Color32::from_rgba_unmultiplied(139, 148, 163, 58),
+            icon: Color32::from_rgb(78, 86, 101),
+            icon_disabled: Color32::from_rgb(194, 199, 208),
+            zoom_icon: Color32::from_rgb(83, 92, 108),
+            branches: BRANCH,
+            dark: false,
+        }
+    }
+
+    fn dark() -> Self {
+        Self {
+            canvas: Color32::from_rgb(22, 24, 29),
+            panel: Color32::from_rgb(31, 34, 41),
+            border: Color32::from_rgb(52, 57, 68),
+            soft: Color32::from_rgb(42, 46, 56),
+            text: Color32::from_rgb(226, 230, 238),
+            heading: Color32::from_rgb(240, 243, 248),
+            muted: Color32::from_rgb(150, 158, 173),
+            accent: Color32::from_rgb(102, 138, 255),
+            on_color: Color32::from_rgb(245, 247, 252),
+            navy: Color32::from_rgb(72, 98, 196),
+            navy_hover: Color32::from_rgb(90, 116, 216),
+            dot: Color32::from_rgba_unmultiplied(120, 132, 155, 72),
+            icon: Color32::from_rgb(184, 192, 206),
+            icon_disabled: Color32::from_rgb(92, 99, 112),
+            zoom_icon: Color32::from_rgb(196, 203, 216),
+            branches: [
+                Color32::from_rgb(108, 148, 245),
+                Color32::from_rgb(74, 199, 156),
+                Color32::from_rgb(242, 170, 84),
+                Color32::from_rgb(166, 138, 245),
+                Color32::from_rgb(242, 136, 168),
+            ],
+            dark: true,
+        }
+    }
+
+    fn of(theme: Theme) -> Self {
+        match theme {
+            Theme::Light => Self::light(),
+            Theme::Dark => Self::dark(),
+        }
+    }
+
+    fn branch(&self, index: usize) -> Color32 {
+        self.branches[index % self.branches.len()]
+    }
+
+    fn node_fill(&self, depth: usize, color: Color32) -> Color32 {
+        match depth {
+            0 => self.navy,
+            1 => color,
+            _ => {
+                if self.dark {
+                    mix(color, self.canvas, 0.78)
+                } else {
+                    tint(color, 0.88)
+                }
+            }
+        }
+    }
+
+    fn node_text(&self, depth: usize) -> Color32 {
+        if depth <= 1 { self.on_color } else { self.text }
+    }
+
+    fn node_border(&self, depth: usize, color: Color32) -> Option<Color32> {
+        if depth <= 1 {
+            None
+        } else {
+            Some(with_alpha(color, if self.dark { 150 } else { 120 }))
+        }
+    }
+}
 
 // -------------------------------------------------------------- document ----
 
@@ -70,6 +195,8 @@ enum Icon {
     Undo,
     Redo,
     Trash,
+    Home,
+    Theme,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +210,38 @@ enum Action {
     ZoomIn,
     ZoomOut,
     ExportPdf,
+    Home,
+    ToggleTheme,
+}
+
+/// Результат взаимодействия со строкой карты в стартовом списке.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    None,
+    Open,
+    Delete,
+}
+
+/// Экран приложения: стартовый список карт или редактор.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Editor,
+}
+
+/// Карта на диске, показанная в стартовом списке.
+struct MapEntry {
+    path: PathBuf,
+    title: String,
+    branches: usize,
+    nodes: usize,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Settings {
+    #[serde(default)]
+    dark: bool,
 }
 
 struct ShotState {
@@ -123,6 +282,12 @@ struct MindMapApp {
     shot: Option<ShotState>,
     auto_pdf: Option<(PathBuf, u32)>,
     pdf_dir: Option<PathBuf>,
+    screen: Screen,
+    theme: Theme,
+    pal: Palette,
+    maps_dir: PathBuf,
+    settings_path: PathBuf,
+    home: Vec<MapEntry>,
 }
 
 fn node(id: u64, text: &str, children: Vec<Node>) -> Node {
@@ -379,6 +544,13 @@ fn tint(color: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(f(color.r()), f(color.g()), f(color.b()))
 }
 
+/// Линейно смешивает цвета: `t = 0` даёт `a`, `t = 1` — `b`.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| -> u8 { (x as f32 * (1.0 - t) + y as f32 * t).round() as u8 };
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
@@ -394,8 +566,97 @@ fn elide(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn branch_color(index: usize) -> Color32 {
-    BRANCH[index % BRANCH.len()]
+// ----------------------------------------------------------------- storage --
+
+fn base_dir() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn load_doc(path: &Path) -> Option<Node> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Node>(&text).ok())
+}
+
+fn count_nodes(n: &Node) -> usize {
+    1 + n.children.iter().map(count_nodes).sum::<usize>()
+}
+
+fn scan_maps(dir: &Path) -> Vec<MapEntry> {
+    let mut out = Vec::new();
+    let Ok(read) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(doc) = load_doc(&path) else {
+            continue;
+        };
+        let title = if doc.text.trim().is_empty() {
+            "Без названия".to_owned()
+        } else {
+            doc.text.clone()
+        };
+        out.push(MapEntry {
+            path,
+            title,
+            branches: doc.children.len(),
+            nodes: count_nodes(&doc),
+            modified: entry.metadata().ok().and_then(|m| m.modified().ok()),
+        });
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+/// Имя для новой карты, уникальное по времени создания.
+fn new_map_path(dir: &Path) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    dir.join(format!("map-{millis}.json"))
+}
+
+fn relative_time(modified: Option<SystemTime>) -> String {
+    let Some(modified) = modified else {
+        return String::new();
+    };
+    let secs = SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..=59 => "только что".to_owned(),
+        60..=3599 => format!("{} мин назад", secs / 60),
+        3600..=86399 => format!("{} ч назад", secs / 3600),
+        _ => format!("{} дн назад", secs / 86400),
+    }
+}
+
+fn branches_label(count: usize) -> String {
+    let word = plural(count, "ветка", "ветки", "веток");
+    format!("{count} {word}")
+}
+
+fn nodes_label(count: usize) -> String {
+    let word = plural(count, "узел", "узла", "узлов");
+    format!("{count} {word}")
+}
+
+fn plural<'a>(count: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    match count % 10 {
+        1 if count % 100 != 11 => one,
+        2..=4 if !(12..=14).contains(&(count % 100)) => few,
+        _ => many,
+    }
 }
 
 // ------------------------------------------------------------------ pdf -----
@@ -537,33 +798,63 @@ fn parse_pdf_arg() -> Option<PathBuf> {
     None
 }
 
+/// Применяет выбранную тему к egui и нашим цветам.
+fn apply_theme(ctx: &egui::Context, theme: Theme, pal: &Palette) {
+    let egui_theme = theme.egui();
+    ctx.set_theme(egui_theme);
+    let mut style = (*ctx.style_of(egui_theme)).clone();
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.visuals.override_text_color = Some(pal.text);
+    style.visuals.selection.bg_fill = with_alpha(pal.accent, 55);
+    style.visuals.selection.stroke = Stroke::new(1.0, pal.accent);
+    ctx.set_style_of(egui_theme, style);
+}
+
 // ------------------------------------------------------------------- app ----
 
 impl MindMapApp {
     fn new(cc: &eframe::CreationContext<'_>, shot: Option<PathBuf>, pdf: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_theme(egui::ThemePreference::Light);
-        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Light)).clone();
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-        style.visuals.override_text_color = Some(TEXT);
-        style.visuals.selection.bg_fill = with_alpha(ACCENT, 55);
-        style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        cc.egui_ctx.set_style_of(egui::Theme::Light, style);
+        let base = base_dir();
+        let maps_dir = base.join("maps");
+        let _ = fs::create_dir_all(&maps_dir);
+        let settings_path = base.join("settings.json");
 
-        let save_path = env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("mindmap.json");
-
-        let loaded = fs::read_to_string(&save_path)
+        let theme = fs::read_to_string(&settings_path)
             .ok()
-            .and_then(|text| serde_json::from_str::<Node>(&text).ok());
+            .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+            .map(|s| if s.dark { Theme::Dark } else { Theme::Light })
+            .unwrap_or(Theme::Light);
+        let pal = Palette::of(theme);
+        apply_theme(&cc.egui_ctx, theme, &pal);
 
-        let (doc, save_ok) = match loaded {
-            Some(doc) if !doc.text.trim().is_empty() => (doc, true),
-            _ => (sample_map(), false),
+        let automation = shot.is_some() || pdf.is_some();
+        let legacy = base.join("mindmap.json");
+
+        // Одноразовый импорт старого mindmap.json в папку карт.
+        if !automation && scan_maps(&maps_dir).is_empty() {
+            if let Some(doc) = load_doc(&legacy) {
+                if !doc.text.trim().is_empty() {
+                    let path = new_map_path(&maps_dir);
+                    if let Ok(json) = serde_json::to_string_pretty(&doc) {
+                        let _ = fs::write(&path, json);
+                    }
+                }
+            }
+        }
+
+        let (doc, save_path, save_ok, screen) = if automation {
+            let (doc, ok) = match load_doc(&legacy) {
+                Some(doc) if !doc.text.trim().is_empty() => (doc, true),
+                _ => (sample_map(), false),
+            };
+            (doc, legacy, ok, Screen::Editor)
+        } else {
+            (empty_map(), maps_dir.join("mindmap.json"), true, Screen::Home)
         };
 
         let next_id = max_id(&doc) + 1;
         let selected = doc.id;
+        let home = scan_maps(&maps_dir);
 
         let mut app = Self {
             doc,
@@ -587,12 +878,74 @@ impl MindMapApp {
             }),
             auto_pdf: pdf.map(|path| (path, 0)),
             pdf_dir: None,
+            screen,
+            theme,
+            pal,
+            maps_dir,
+            settings_path,
+            home,
         };
 
         if !app.save_ok {
             app.save();
         }
         app
+    }
+
+    /// Открывает стартовый экран со свежим списком карт.
+    fn go_home(&mut self, ctx: &egui::Context) {
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        self.save();
+        self.refresh_home();
+        self.screen = Screen::Home;
+        self.drag = None;
+        self.panning = false;
+        ctx.request_repaint();
+    }
+
+    fn refresh_home(&mut self) {
+        self.home = scan_maps(&self.maps_dir);
+    }
+
+    /// Открывает карту с диска в редакторе.
+    fn open_map(&mut self, path: PathBuf) {
+        let Some(doc) = load_doc(&path) else {
+            self.toast = Some(("Не удалось открыть карту".to_owned(), Instant::now()));
+            return;
+        };
+        self.doc = doc;
+        self.next_id = max_id(&self.doc) + 1;
+        self.selected = self.doc.id;
+        self.editing = None;
+        self.drag = None;
+        self.panning = false;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.camera = Camera::default();
+        self.needs_fit = true;
+        self.save_path = path;
+        self.save_ok = true;
+        self.screen = Screen::Editor;
+    }
+
+    fn delete_map(&mut self, path: &Path) {
+        let _ = fs::remove_file(path);
+        self.refresh_home();
+    }
+
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.theme = self.theme.toggled();
+        self.pal = Palette::of(self.theme);
+        apply_theme(ctx, self.theme, &self.pal);
+        let settings = Settings {
+            dark: self.theme == Theme::Dark,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&settings) {
+            let _ = fs::write(&self.settings_path, json);
+        }
+        ctx.request_repaint();
     }
 
     fn save(&mut self) {
@@ -640,13 +993,19 @@ impl MindMapApp {
     }
 
     fn new_map(&mut self) {
-        self.push_undo();
         self.doc = empty_map();
         self.next_id = 2;
         self.selected = self.doc.id;
         self.editing = None;
         self.drag = None;
+        self.panning = false;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.camera = Camera::default();
         self.needs_fit = true;
+        self.save_path = new_map_path(&self.maps_dir);
+        self.save_ok = true;
+        self.screen = Screen::Editor;
         self.save();
     }
 
@@ -795,6 +1154,8 @@ impl MindMapApp {
             Action::Delete => self.delete_selected(),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
+            Action::Home => self.go_home(ctx),
+            Action::ToggleTheme => self.toggle_theme(ctx),
             Action::Fit => self.needs_fit = true,
             Action::ZoomIn => {
                 self.camera.zoom = (self.camera.zoom * 1.2).clamp(0.3, 2.6);
@@ -863,6 +1224,8 @@ impl MindMapApp {
             return Err("карта пуста".to_owned());
         }
         let path = path.to_path_buf();
+        // PDF всегда рисуем светлыми цветами — он предназначен для печати.
+        let pal = Palette::light();
 
         // Границы карты в мировых (экранных) точках.
         let mut bounds = layout[0].rect;
@@ -940,7 +1303,7 @@ impl MindMapApp {
             };
             let dx = (p3.x - p0.x) * 0.55;
             ops.push(PdfOp::SetOutlineColor {
-                col: pdf_rgb(branch_color(laid.color)),
+                col: pdf_rgb(pal.branch(laid.color)),
             });
             ops.push(PdfOp::SetOutlineThickness {
                 pt: PdfPt((1.8 * scale).max(0.8)),
@@ -964,13 +1327,13 @@ impl MindMapApp {
             let x1 = map_x(laid.rect.right());
             let y_bottom = map_y(laid.rect.bottom());
             let y_top = map_y(laid.rect.top());
-            let color = branch_color(laid.color);
+            let color = pal.branch(laid.color);
             let radius = self.node_radius(laid.depth) * scale;
 
             let (fill, border, text_color) = match laid.depth {
-                0 => (NAVY, None, WHITE),
-                1 => (color, None, WHITE),
-                _ => (tint(color, 0.88), Some(color), TEXT),
+                0 => (pal.navy, None, pal.on_color),
+                1 => (color, None, pal.on_color),
+                _ => (pal.node_fill(laid.depth, color), pal.node_border(laid.depth, color), pal.text),
             };
 
             ops.push(PdfOp::SetFillColor { col: pdf_rgb(fill) });
@@ -1121,6 +1484,8 @@ impl MindMapApp {
             return;
         }
 
+        let pal = self.pal;
+
         let layout = build_layout(&self.doc, ctx);
         if self.needs_fit {
             let size = canvas_rect.size();
@@ -1171,13 +1536,13 @@ impl MindMapApp {
         let screen_rect = |r: Rect| Rect::from_min_max(to_screen(r.min), to_screen(r.max));
 
         let painter = ui.painter_at(canvas_rect);
-        painter.rect_filled(canvas_rect, 0, CANVAS);
+        painter.rect_filled(canvas_rect, 0, pal.canvas);
 
         // Soft dot grid.
         let spacing = 28.0 * camera.zoom;
         if spacing > 11.0 {
             let origin = canvas_rect.center() + camera.pan * camera.zoom;
-            let dot = Color32::from_rgba_unmultiplied(139, 148, 163, 58);
+            let dot = pal.dot;
             let base_x = origin.x - ((origin.x - canvas_rect.left()) / spacing).floor() * spacing;
             let base_y = origin.y - ((origin.y - canvas_rect.top()) / spacing).floor() * spacing;
             let nx = ((canvas_rect.width() / spacing).ceil() as i32 + 2).min(220);
@@ -1220,7 +1585,7 @@ impl MindMapApp {
                 )
             };
             let dx = (p3.x - p0.x) * 0.55;
-            let color = branch_color(laid.color);
+            let color = pal.branch(laid.color);
             let stroke = Stroke::new((2.0 * camera.zoom).clamp(1.1, 2.8), with_alpha(color, 175));
             let curve = egui::epaint::CubicBezierShape::from_points_stroke(
                 [
@@ -1297,7 +1662,7 @@ impl MindMapApp {
                 painter.rect_stroke(
                     rect.expand(4.0),
                     cr(radius + 3.0),
-                    Stroke::new(2.6, ACCENT),
+                    Stroke::new(2.6, pal.accent),
                     StrokeKind::Outside,
                 );
             }
@@ -1309,13 +1674,8 @@ impl MindMapApp {
                 if let Some(rect) = rects.get(&id).copied() {
                     let size = rect.size() * 0.96;
                     let ghost = Rect::from_center_size(pointer + Vec2::new(0.0, -6.0), size);
-                    let fill = if laid.depth == 0 {
-                        NAVY
-                    } else if laid.depth == 1 {
-                        branch_color(laid.color)
-                    } else {
-                        tint(branch_color(laid.color), 0.86)
-                    };
+                    let color = pal.branch(laid.color);
+                    let fill = pal.node_fill(laid.depth, color);
                     painter.rect_filled(
                         ghost.translate(Vec2::new(0.0, 5.0)),
                         cr(self.node_radius(laid.depth)),
@@ -1325,17 +1685,17 @@ impl MindMapApp {
                         ghost,
                         cr(self.node_radius(laid.depth)),
                         with_alpha(fill, 235),
-                        Stroke::new(1.2, with_alpha(branch_color(laid.color), 160)),
+                        Stroke::new(1.2, with_alpha(color, 160)),
                         StrokeKind::Inside,
                     );
-                    let color = if laid.depth <= 1 { WHITE } else { TEXT };
+                    let text_color = pal.node_text(laid.depth);
                     let font = laid_font(laid.depth) * camera.zoom;
                     painter.text(
                         ghost.center(),
                         Align2::CENTER_CENTER,
                         elide(&laid.text, 26),
                         FontId::proportional(font),
-                        color,
+                        text_color,
                     );
                 }
             }
@@ -1406,13 +1766,12 @@ impl MindMapApp {
         selected: bool,
         editing: bool,
     ) {
-        let color = branch_color(laid.color);
+        let pal = self.pal;
+        let color = pal.branch(laid.color);
         let radius = self.node_radius(laid.depth);
-        let (fill, text_color, border) = match laid.depth {
-            0 => (NAVY, WHITE, None),
-            1 => (color, WHITE, None),
-            _ => (tint(color, 0.88), TEXT, Some(with_alpha(color, 120))),
-        };
+        let fill = pal.node_fill(laid.depth, color);
+        let text_color = pal.node_text(laid.depth);
+        let border = pal.node_border(laid.depth, color);
 
         painter.rect_filled(
             rect.translate(Vec2::new(0.0, 3.0 * zoom)),
@@ -1433,7 +1792,7 @@ impl MindMapApp {
             painter.rect_stroke(
                 rect.expand(3.5),
                 cr(radius + 3.0),
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(2.0, pal.accent),
                 StrokeKind::Outside,
             );
         }
@@ -1478,7 +1837,7 @@ impl MindMapApp {
 
         let zoom = self.camera.zoom;
         let font_size = laid_font(laid.depth) * zoom;
-        let text_color = if laid.depth <= 1 { WHITE } else { TEXT };
+        let text_color = self.pal.node_text(laid.depth);
         let pad = match laid.depth {
             0 => 24.0,
             1 => 20.0,
@@ -1591,10 +1950,137 @@ impl MindMapApp {
         ctx.request_repaint();
     }
 
+    // -------------------------------------------------------------- home ----
+
+    fn home_ui(&mut self, root_ui: &mut egui::Ui, ctx: &egui::Context) {
+        let pal = self.pal;
+        let mut open: Option<PathBuf> = None;
+        let mut delete: Option<PathBuf> = None;
+        let mut toggle = false;
+        let mut make_new = false;
+
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(pal.canvas))
+            .show(root_ui, |ui| {
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    draw_logo(ui, &pal);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Карта мыслей")
+                            .size(17.0)
+                            .color(pal.heading)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(24.0);
+                        let tip = if pal.dark {
+                            "Светлая тема"
+                        } else {
+                            "Тёмная тема"
+                        };
+                        if icon_button(ui, &pal, Icon::Theme, true, tip) {
+                            toggle = true;
+                        }
+                    });
+                });
+
+                ui.add_space(30.0);
+
+                ui.vertical_centered(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(660.0, ui.available_height()),
+                        Layout::top_down(Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new("Ваши карты")
+                                    .size(25.0)
+                                    .color(pal.heading)
+                                    .strong(),
+                            );
+                            ui.add_space(5.0);
+                            ui.label(
+                                RichText::new("Выберите сохранённую карту или создайте новую")
+                                    .size(13.0)
+                                    .color(pal.muted),
+                            );
+                            ui.add_space(20.0);
+                            if pill_button(ui, &pal, "+ Новая карта", true, 190.0, "Создать карту")
+                            {
+                                make_new = true;
+                            }
+                            ui.add_space(22.0);
+
+                            Frame::new()
+                                .fill(pal.panel)
+                                .corner_radius(cr(16.0))
+                                .stroke(Stroke::new(1.0, pal.border))
+                                .inner_margin(Margin::same(14))
+                                .show(ui, |ui| {
+                                    ui.set_width(632.0);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(400.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            if self.home.is_empty() {
+                                                ui.add_space(28.0);
+                                                ui.vertical_centered(|ui| {
+                                                    ui.label(
+                                                        RichText::new("Сохранённых карт пока нет")
+                                                            .size(14.0)
+                                                            .color(pal.heading),
+                                                    );
+                                                    ui.add_space(5.0);
+                                                    ui.label(
+                                                        RichText::new(
+                                                            "Создайте первую карту кнопкой выше",
+                                                        )
+                                                        .size(12.0)
+                                                        .color(pal.muted),
+                                                    );
+                                                });
+                                                ui.add_space(28.0);
+                                            } else {
+                                                for entry in &self.home {
+                                                    match map_row(ui, &pal, entry) {
+                                                        RowAction::Open => {
+                                                            open = Some(entry.path.clone())
+                                                        }
+                                                        RowAction::Delete => {
+                                                            delete = Some(entry.path.clone())
+                                                        }
+                                                        RowAction::None => {}
+                                                    }
+                                                    ui.add_space(6.0);
+                                                }
+                                            }
+                                        });
+                                });
+                        },
+                    );
+                });
+            });
+
+        if toggle {
+            self.toggle_theme(ctx);
+        }
+        if make_new {
+            self.new_map();
+        }
+        if let Some(path) = delete {
+            self.delete_map(&path);
+        }
+        if let Some(path) = open {
+            self.open_map(path);
+        }
+    }
+
     // ------------------------------------------------------------- chrome ---
 
     fn top_bar(&mut self, root_ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut actions: Vec<Action> = Vec::new();
+        let pal = self.pal;
         let can_undo = !self.undo_stack.is_empty();
         let can_redo = !self.redo_stack.is_empty();
         let can_delete = self.selected != self.doc.id;
@@ -1614,58 +2100,71 @@ impl MindMapApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(WHITE)
+                    .fill(pal.panel)
                     .inner_margin(Margin::symmetric(18, 0)),
             )
             .show(root_ui, |ui| {
                 let panel = ui.max_rect();
                 ui.painter().line_segment(
                     [panel.left_bottom(), panel.right_bottom()],
-                    Stroke::new(1.0, BORDER),
+                    Stroke::new(1.0, pal.border),
                 );
 
                 ui.horizontal_centered(|ui| {
-                    draw_logo(ui);
+                    if icon_button(ui, &pal, Icon::Home, true, "К списку карт") {
+                        actions.push(Action::Home);
+                    }
+                    ui.add_space(4.0);
+                    draw_logo(ui, &pal);
                     ui.add_space(10.0);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(360.0, 40.0),
+                        Vec2::new(320.0, 40.0),
                         Layout::top_down(Align::LEFT),
                         |ui| {
                             ui.add_space(9.0);
-                            ui.label(RichText::new(title).size(16.0).color(NAVY).strong());
+                            ui.label(RichText::new(title).size(16.0).color(pal.heading).strong());
                             ui.add_space(1.0);
-                            ui.label(RichText::new(subtitle).size(10.5).color(MUTED));
+                            ui.label(RichText::new(subtitle).size(10.5).color(pal.muted));
                         },
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if pill_button(ui, "+ Ветка", true, 102.0, "Добавить ветку (Tab)")
-                        {
+                        if pill_button(ui, &pal, "+ Ветка", true, 102.0, "Добавить ветку (Tab)") {
                             actions.push(Action::AddChild);
                         }
-                        if pill_button(ui, "Новая", false, 74.0, "Новая карта (Cmd+N)")
-                        {
+                        if pill_button(ui, &pal, "Новая", false, 74.0, "Новая карта (Cmd+N)") {
                             actions.push(Action::NewMap);
                         }
-                        if pill_button(ui, "PDF", false, 60.0, "Сохранить карту в PDF (Cmd+P)")
+                        if pill_button(ui, &pal, "PDF", false, 60.0, "Сохранить карту в PDF (Cmd+P)")
                         {
                             actions.push(Action::ExportPdf);
                         }
                         ui.add_space(6.0);
                         let (line, _) =
                             ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
-                        ui.painter().rect_filled(line, 0, BORDER);
+                        ui.painter().rect_filled(line, 0, pal.border);
                         ui.add_space(6.0);
-                        if icon_button(ui, Icon::Trash, can_delete, "Удалить ветку (Delete)")
-                        {
+                        if icon_button(ui, &pal, Icon::Trash, can_delete, "Удалить ветку (Delete)") {
                             actions.push(Action::Delete);
                         }
-                        if icon_button(ui, Icon::Redo, can_redo, "Повторить (Cmd+Shift+Z)")
-                        {
+                        if icon_button(ui, &pal, Icon::Redo, can_redo, "Повторить (Cmd+Shift+Z)") {
                             actions.push(Action::Redo);
                         }
-                        if icon_button(ui, Icon::Undo, can_undo, "Отменить (Cmd+Z)") {
+                        if icon_button(ui, &pal, Icon::Undo, can_undo, "Отменить (Cmd+Z)") {
                             actions.push(Action::Undo);
+                        }
+                        ui.add_space(6.0);
+                        let (line, _) =
+                            ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
+                        ui.painter().rect_filled(line, 0, pal.border);
+                        ui.add_space(6.0);
+                        let tip = if self.theme == Theme::Dark {
+                            "Светлая тема"
+                        } else {
+                            "Тёмная тема"
+                        };
+                        if icon_button(ui, &pal, Icon::Theme, true, tip) {
+                            actions.push(Action::ToggleTheme);
                         }
                     });
                 });
@@ -1678,6 +2177,7 @@ impl MindMapApp {
 
     fn bottom_bar(&mut self, root_ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut actions: Vec<Action> = Vec::new();
+        let pal = self.pal;
         let zoom = self.camera.zoom;
         let _ = ctx;
 
@@ -1686,14 +2186,14 @@ impl MindMapApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(WHITE)
+                    .fill(pal.panel)
                     .inner_margin(Margin::symmetric(18, 0)),
             )
             .show(root_ui, |ui| {
                 let panel = ui.max_rect();
                 ui.painter().line_segment(
                     [panel.left_top(), panel.right_top()],
-                    Stroke::new(1.0, BORDER),
+                    Stroke::new(1.0, pal.border),
                 );
 
                 ui.horizontal_centered(|ui| {
@@ -1702,18 +2202,18 @@ impl MindMapApp {
                             "Tab — ветка · Enter — ещё одна · Delete — удалить · двойной клик — изменить · Cmd+P — PDF",
                         )
                         .size(11.0)
-                        .color(MUTED),
+                        .color(pal.muted),
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if pill_button(ui, "По размеру", false, 92.0, "Вписать карту в окно (F)") {
+                        if pill_button(ui, &pal, "По размеру", false, 92.0, "Вписать карту в окно (F)") {
                             actions.push(Action::Fit);
                         }
                         ui.add_space(8.0);
 
                         let (group, _) =
                             ui.allocate_exact_size(Vec2::new(124.0, 27.0), Sense::hover());
-                        ui.painter().rect_filled(group, cr(8.0), SOFT);
+                        ui.painter().rect_filled(group, cr(8.0), pal.soft);
                         let minus_rect =
                             Rect::from_min_size(group.min, Vec2::new(29.0, group.height()));
                         let plus_rect = Rect::from_min_size(
@@ -1723,12 +2223,12 @@ impl MindMapApp {
                         let minus = ui.interact(minus_rect, Id::new("zoom_out"), Sense::click());
                         let plus = ui.interact(plus_rect, Id::new("zoom_in"), Sense::click());
                         if minus.hovered() {
-                            ui.painter().rect_filled(minus_rect, cr(8.0), BORDER);
+                            ui.painter().rect_filled(minus_rect, cr(8.0), pal.border);
                         }
                         if plus.hovered() {
-                            ui.painter().rect_filled(plus_rect, cr(8.0), BORDER);
+                            ui.painter().rect_filled(plus_rect, cr(8.0), pal.border);
                         }
-                        let icon_color = Color32::from_rgb(83, 92, 108);
+                        let icon_color = pal.zoom_icon;
                         let mc = minus_rect.center();
                         ui.painter().line_segment(
                             [Pos2::new(mc.x - 4.5, mc.y), Pos2::new(mc.x + 4.5, mc.y)],
@@ -1748,7 +2248,7 @@ impl MindMapApp {
                             Align2::CENTER_CENTER,
                             format!("{}%", (zoom * 100.0).round() as i32),
                             FontId::proportional(11.0),
-                            TEXT,
+                            pal.text,
                         );
                         if minus.clicked() {
                             actions.push(Action::ZoomOut);
@@ -1774,12 +2274,12 @@ fn laid_font(depth: usize) -> f32 {
     }
 }
 
-fn draw_logo(ui: &mut egui::Ui) {
+fn draw_logo(ui: &mut egui::Ui, pal: &Palette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, cr(9.0), NAVY);
+    painter.rect_filled(rect, cr(9.0), pal.navy);
     let c = rect.center() + Vec2::new(-2.0, 0.0);
-    let branch = Color32::from_rgb(150, 184, 255);
+    let branch = mix(pal.navy, WHITE, if pal.dark { 0.55 } else { 0.55 });
     let tips = [
         c + Vec2::new(8.0, -6.5),
         c + Vec2::new(10.0, 0.0),
@@ -1789,48 +2289,137 @@ fn draw_logo(ui: &mut egui::Ui) {
         painter.line_segment([c, tip], Stroke::new(1.4, branch));
         painter.circle_filled(tip, 1.8, branch);
     }
-    painter.circle_filled(c, 2.4, WHITE);
+    painter.circle_filled(c, 2.4, pal.on_color);
 }
 
-fn pill_button(ui: &mut egui::Ui, label: &str, primary: bool, min_width: f32, tip: &str) -> bool {
+fn map_row(ui: &mut egui::Ui, pal: &Palette, entry: &MapEntry) -> RowAction {
+    let width = ui.available_width().max(120.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 62.0), Sense::click());
+
+    let delete_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - 22.0, rect.center().y),
+        Vec2::splat(30.0),
+    );
+    let delete_resp = ui.interact(
+        delete_rect,
+        Id::new(("map_delete", entry.path.clone())),
+        Sense::click(),
+    );
+
+    let hovered = response.hovered() || delete_resp.hovered();
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, cr(12.0), pal.soft);
+    }
+
+    // Мини-иконка карты.
+    let icon = Rect::from_center_size(
+        Pos2::new(rect.left() + 30.0, rect.center().y),
+        Vec2::splat(34.0),
+    );
+    painter.rect_filled(icon, cr(10.0), pal.navy);
+    let center = icon.center();
+    let branch = mix(pal.navy, WHITE, 0.55);
+    for tip in [
+        center + Vec2::new(8.0, -6.0),
+        center + Vec2::new(9.5, 0.0),
+        center + Vec2::new(8.0, 6.0),
+    ] {
+        painter.line_segment([center, tip], Stroke::new(1.3, branch));
+        painter.circle_filled(tip, 1.6, branch);
+    }
+    painter.circle_filled(center, 2.2, pal.on_color);
+
+    let text_left = icon.right() + 14.0;
+    let max_title = ((delete_rect.left() - text_left - 12.0) / 7.4).max(8.0) as usize;
+    painter.text(
+        Pos2::new(text_left, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        elide(&entry.title, max_title),
+        FontId::proportional(14.5),
+        pal.heading,
+    );
+    let sub = format!(
+        "{} · {} · изменено {}",
+        branches_label(entry.branches),
+        nodes_label(entry.nodes),
+        relative_time(entry.modified)
+    );
+    painter.text(
+        Pos2::new(text_left, rect.center().y + 11.0),
+        Align2::LEFT_CENTER,
+        elide(&sub, 62),
+        FontId::proportional(11.5),
+        pal.muted,
+    );
+
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        let bg = pal.soft;
+        draw_icon(ui.painter(), delete_rect, Icon::Trash, pal.icon, pal, bg);
+    }
+
+    if delete_resp.clicked() {
+        RowAction::Delete
+    } else if response.clicked() {
+        RowAction::Open
+    } else {
+        RowAction::None
+    }
+}
+
+fn pill_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    primary: bool,
+    min_width: f32,
+    tip: &str,
+) -> bool {
     let font = FontId::proportional(13.5);
-    let color = if primary { WHITE } else { TEXT };
+    let color = if primary { pal.on_color } else { pal.text };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     let width = (galley.size().x + 30.0).max(min_width);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
     let response = response.on_hover_text(tip);
     let (fill, hover_fill) = if primary {
-        (NAVY, NAVY_HOVER)
+        (pal.navy, pal.navy_hover)
     } else {
-        (Color32::TRANSPARENT, SOFT)
+        (Color32::TRANSPARENT, pal.soft)
     };
     let fill = if response.hovered() { hover_fill } else { fill };
     ui.painter().rect_filled(rect, cr(10.0), fill);
     if !primary && response.hovered() {
         ui.painter()
-            .rect_stroke(rect, cr(10.0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
+            .rect_stroke(rect, cr(10.0), Stroke::new(1.0, pal.border), StrokeKind::Inside);
     }
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, color);
     response.clicked()
 }
 
-fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tip: &str) -> bool {
+fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, enabled: bool, tip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
     let response = response.on_hover_text(tip);
-    if response.hovered() && enabled {
-        ui.painter().rect_filled(rect, cr(9.0), SOFT);
-    }
-    let color = if enabled {
-        Color32::from_rgb(78, 86, 101)
+    let bg = if response.hovered() && enabled {
+        ui.painter().rect_filled(rect, cr(9.0), pal.soft);
+        pal.soft
     } else {
-        Color32::from_rgb(194, 199, 208)
+        pal.panel
     };
-    draw_icon(ui.painter(), rect, icon, color);
+    let color = if enabled { pal.icon } else { pal.icon_disabled };
+    draw_icon(ui.painter(), rect, icon, color, pal, bg);
     response.clicked() && enabled
 }
 
-fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+fn draw_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    icon: Icon,
+    color: Color32,
+    pal: &Palette,
+    bg: Color32,
+) {
     let c = rect.center();
     let stroke = Stroke::new(1.7, color);
     match icon {
@@ -1892,6 +2481,50 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 Stroke::new(1.3, color),
             );
         }
+        Icon::Home => {
+            let roof = c.y - 3.0;
+            painter.add(egui::Shape::line(
+                vec![
+                    Pos2::new(c.x - 7.5, roof + 3.0),
+                    Pos2::new(c.x, roof - 3.5),
+                    Pos2::new(c.x + 7.5, roof + 3.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    Pos2::new(c.x - 5.0, roof + 2.6),
+                    Pos2::new(c.x - 5.0, c.y + 7.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(c.x + 5.0, roof + 2.6),
+                    Pos2::new(c.x + 5.0, c.y + 7.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x - 5.0, c.y + 7.0), Pos2::new(c.x + 5.0, c.y + 7.0)],
+                stroke,
+            );
+        }
+        Icon::Theme => {
+            if pal.dark {
+                // Солнце.
+                painter.circle_stroke(c, 4.0, stroke);
+                for i in 0..8 {
+                    let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                    let dir = Vec2::new(a.cos(), a.sin());
+                    painter.line_segment([c + dir * 6.2, c + dir * 8.4], stroke);
+                }
+            } else {
+                // Луна: круг с вырезанным смещённым кругом.
+                painter.circle_filled(c, 6.8, color);
+                painter.circle_filled(c + Vec2::new(3.6, -3.2), 6.4, bg);
+            }
+        }
     }
 }
 
@@ -1899,15 +2532,21 @@ impl eframe::App for MindMapApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         self.handle_screenshot_event(&ctx);
-        self.handle_keys(&ctx);
-        self.top_bar(root_ui, &ctx);
-        self.bottom_bar(root_ui, &ctx);
 
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(CANVAS))
-            .show(root_ui, |ui| {
-                self.canvas_ui(ui, &ctx);
-            });
+        match self.screen {
+            Screen::Home => self.home_ui(root_ui, &ctx),
+            Screen::Editor => {
+                self.handle_keys(&ctx);
+                self.top_bar(root_ui, &ctx);
+                self.bottom_bar(root_ui, &ctx);
+
+                egui::CentralPanel::default()
+                    .frame(Frame::new().fill(self.pal.canvas))
+                    .show(root_ui, |ui| {
+                        self.canvas_ui(ui, &ctx);
+                    });
+            }
+        }
 
         self.screenshot_tick(&ctx);
         self.auto_pdf_tick(&ctx);
