@@ -31,6 +31,10 @@ const BRANCH: [Color32; 5] = [
 const V_GAP: f32 = 18.0;
 const BRANCH_GAP: f32 = 28.0;
 
+/// Минимальные размеры узла свободного холста при растягивании.
+const MIN_NODE_W: f32 = 96.0;
+const MIN_NODE_H: f32 = 44.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
     Light,
@@ -174,6 +178,55 @@ struct Node {
     children: Vec<Node>,
 }
 
+/// Маркер формата свободного холста. Обычные карты-деревья его не содержат.
+const CANVAS_FORMAT: &str = "canvas";
+
+/// Узел свободного холста: подпись, координаты центра и размеры рамки.
+#[derive(Clone, Serialize, Deserialize)]
+struct CanvasNode {
+    id: u64,
+    text: String,
+    x: f32,
+    y: f32,
+    #[serde(default)]
+    w: f32,
+    #[serde(default)]
+    h: f32,
+    #[serde(default)]
+    color: usize,
+}
+
+/// Связь между узлами холста: `from` — источник, `to` — цель.
+#[derive(Clone, Serialize, Deserialize)]
+struct CanvasEdge {
+    from: u64,
+    to: u64,
+}
+
+/// Второй формат карты — свободный холст: узлы лежат где угодно и связаны
+/// произвольными рёбрами. В отличие от дерева [`Node`], иерархии здесь нет.
+#[derive(Clone, Serialize, Deserialize)]
+struct CanvasDoc {
+    format: String,
+    title: String,
+    nodes: Vec<CanvasNode>,
+    #[serde(default)]
+    edges: Vec<CanvasEdge>,
+}
+
+/// Документ карты с диска: обычное дерево или свободный холст.
+enum Doc {
+    Tree(Node),
+    Canvas(CanvasDoc),
+}
+
+/// Снимок документа для истории отмены.
+#[derive(Clone)]
+enum Snapshot {
+    Tree(Node),
+    Canvas(CanvasDoc),
+}
+
 #[derive(Clone)]
 struct EditState {
     id: u64,
@@ -187,7 +240,9 @@ struct Laid {
     rect: Rect,
     depth: usize,
     color: usize,
-    parent: Option<u64>,
+    parents: Vec<u64>,
+    /// Текст узла переносится по ширине рамки (для свободного холста).
+    wrap: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +257,8 @@ enum Icon {
 #[derive(Clone, Copy)]
 enum Action {
     AddChild,
+    AddNode,
+    ToggleLink,
     NewMap,
     Delete,
     Undo,
@@ -235,6 +292,8 @@ struct MapEntry {
     title: String,
     branches: usize,
     nodes: usize,
+    /// `true` для свободного холста, `false` для карты-дерева.
+    canvas: bool,
     modified: Option<SystemTime>,
 }
 
@@ -266,15 +325,25 @@ impl Default for Camera {
 
 struct MindMapApp {
     doc: Node,
+    /// Открытый свободный холст (если текущая карта формата `canvas`).
+    canvas: Option<CanvasDoc>,
     next_id: u64,
     selected: u64,
     editing: Option<EditState>,
-    undo_stack: Vec<Node>,
-    redo_stack: Vec<Node>,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
     camera: Camera,
     drag: Option<u64>,
     panning: bool,
     hovered: Option<u64>,
+    /// Режим связывания узлов холста.
+    linking: bool,
+    /// Первый выбранный узел в режиме связывания.
+    link_from: Option<u64>,
+    /// Узел, который сейчас тянут за угол для изменения размера.
+    resize: Option<u64>,
+    /// Верхний-левый угол (мировые координаты), закреплённый при растягивании.
+    resize_anchor: Option<Pos2>,
     needs_fit: bool,
     save_ok: bool,
     save_path: PathBuf,
@@ -339,6 +408,12 @@ fn sample_map() -> Node {
 
 fn empty_map() -> Node {
     node(1, "Моя карта", vec![])
+}
+
+/// Лёгкая «обёртка»-дерево для холста: держит заголовок в [`MindMapApp::doc`],
+/// чтобы верхняя панель и сохранение имени продолжали работать.
+fn canvas_wrapper(title: &str) -> Node {
+    node(1, title, vec![])
 }
 
 fn find<'a>(n: &'a Node, id: u64) -> Option<&'a Node> {
@@ -439,7 +514,8 @@ fn place_branch(
         rect,
         depth,
         color,
-        parent: Some(parent),
+        parents: vec![parent],
+        wrap: false,
     });
 
     if node.children.is_empty() {
@@ -484,7 +560,8 @@ fn build_layout(root: &Node, ctx: &egui::Context) -> Vec<Laid> {
         rect: Rect::from_center_size(Pos2::ZERO, root_size),
         depth: 0,
         color: 0,
-        parent: None,
+        parents: Vec::new(),
+        wrap: false,
     });
 
     let right: Vec<(usize, &Node)> = root
@@ -532,6 +609,45 @@ fn build_layout(root: &Node, ctx: &egui::Context) -> Vec<Laid> {
     out
 }
 
+/// Размер узла свободного холста: сохранённый, либо вычисленный по тексту.
+fn canvas_node_size(n: &CanvasNode, ctx: &egui::Context) -> Vec2 {
+    if n.w > 1.0 && n.h > 1.0 {
+        Vec2::new(n.w, n.h)
+    } else {
+        node_metrics(&n.text, 2, ctx)
+    }
+}
+
+/// Раскладывает свободный холст в узлы [`Laid`]: у каждого узла свои координаты
+/// и размеры, а рёбра превращаются в список источников («родителей»).
+fn canvas_layout(canvas: &CanvasDoc, ctx: &egui::Context) -> Vec<Laid> {
+    let mut sources: HashMap<u64, Vec<u64>> = HashMap::new();
+    for edge in &canvas.edges {
+        sources.entry(edge.to).or_default().push(edge.from);
+    }
+    canvas
+        .nodes
+        .iter()
+        .map(|n| {
+            let size = canvas_node_size(n, ctx);
+            let depth = if sources.get(&n.id).map(|v| v.is_empty()).unwrap_or(true) {
+                1
+            } else {
+                2
+            };
+            Laid {
+                id: n.id,
+                text: n.text.clone(),
+                rect: Rect::from_center_size(Pos2::new(n.x, n.y), size),
+                depth,
+                color: n.color,
+                parents: sources.get(&n.id).cloned().unwrap_or_default(),
+                wrap: true,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------- helpers ---
 
 fn cr(radius: f32) -> CornerRadius {
@@ -553,6 +669,74 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// Квадрат-манипулятор в правом нижнем углу узла для изменения размера.
+fn resize_handle_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(
+        Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0),
+        Vec2::splat(14.0),
+    )
+}
+
+/// Треугольный наконечник стрелки в точке `tip`, направленный вдоль `dir`.
+fn draw_arrowhead(painter: &egui::Painter, tip: Pos2, dir: Vec2, size: f32, color: Color32) {
+    if dir.length_sq() < f32::EPSILON {
+        return;
+    }
+    let dir = dir.normalized();
+    let perp = Vec2::new(-dir.y, dir.x);
+    let back = tip - dir * size;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, back + perp * size * 0.5, back - perp * size * 0.5],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// Кубическая кривая между двумя узлами. Соединяет обращённые друг к другу
+/// стороны рамок: по горизонтали, если узлы стоят бок о бок, иначе по вертикали.
+fn edge_curve(a: Rect, b: Rect) -> [Pos2; 4] {
+    let d = b.center() - a.center();
+    if d.x.abs() >= d.y.abs() {
+        let (p0, p3) = if d.x >= 0.0 {
+            (
+                Pos2::new(a.right() - 1.0, a.center().y),
+                Pos2::new(b.left() + 1.0, b.center().y),
+            )
+        } else {
+            (
+                Pos2::new(a.left() + 1.0, a.center().y),
+                Pos2::new(b.right() - 1.0, b.center().y),
+            )
+        };
+        let dx = (p3.x - p0.x) * 0.55;
+        [
+            p0,
+            Pos2::new(p0.x + dx, p0.y),
+            Pos2::new(p3.x - dx, p3.y),
+            p3,
+        ]
+    } else {
+        let (p0, p3) = if d.y >= 0.0 {
+            (
+                Pos2::new(a.center().x, a.bottom() - 1.0),
+                Pos2::new(b.center().x, b.top() + 1.0),
+            )
+        } else {
+            (
+                Pos2::new(a.center().x, a.top() + 1.0),
+                Pos2::new(b.center().x, b.bottom() - 1.0),
+            )
+        };
+        let dy = (p3.y - p0.y) * 0.55;
+        [
+            p0,
+            Pos2::new(p0.x, p0.y + dy),
+            Pos2::new(p3.x, p3.y - dy),
+            p3,
+        ]
+    }
 }
 
 fn elide(text: &str, max_chars: usize) -> String {
@@ -578,6 +762,23 @@ fn load_doc(path: &Path) -> Option<Node> {
         .and_then(|text| serde_json::from_str::<Node>(&text).ok())
 }
 
+/// Читает документ карты любого формата: сначала пробуем свободный холст
+/// (`canvas`), затем обычное дерево.
+fn load_file(path: &Path) -> Option<Doc> {
+    let text = fs::read_to_string(path).ok()?;
+    load_file_str(&text)
+}
+
+/// Разбирает содержимое файла карты (см. [`load_file`]).
+fn load_file_str(text: &str) -> Option<Doc> {
+    if let Ok(canvas) = serde_json::from_str::<CanvasDoc>(text)
+        && canvas.format == CANVAS_FORMAT
+    {
+        return Some(Doc::Canvas(canvas));
+    }
+    serde_json::from_str::<Node>(text).ok().map(Doc::Tree)
+}
+
 fn count_nodes(n: &Node) -> usize {
     1 + n.children.iter().map(count_nodes).sum::<usize>()
 }
@@ -596,19 +797,33 @@ fn scan_maps(dir: &Path) -> Vec<MapEntry> {
         {
             continue;
         }
-        let Some(doc) = load_doc(&path) else {
+        let Some(doc) = load_file(&path) else {
             continue;
         };
-        let title = if doc.text.trim().is_empty() {
-            "Без названия".to_owned()
-        } else {
-            doc.text.clone()
+        let (title, branches, nodes, canvas) = match doc {
+            Doc::Tree(node) => {
+                let title = if node.text.trim().is_empty() {
+                    "Без названия".to_owned()
+                } else {
+                    node.text.clone()
+                };
+                (title, node.children.len(), count_nodes(&node), false)
+            }
+            Doc::Canvas(canvas) => {
+                let title = if canvas.title.trim().is_empty() {
+                    "Без названия".to_owned()
+                } else {
+                    canvas.title.clone()
+                };
+                (title, canvas.edges.len(), canvas.nodes.len(), true)
+            }
         };
         out.push(MapEntry {
             path,
             title,
-            branches: doc.children.len(),
-            nodes: count_nodes(&doc),
+            branches,
+            nodes,
+            canvas,
             modified: entry.metadata().ok().and_then(|m| m.modified().ok()),
         });
     }
@@ -842,22 +1057,36 @@ impl MindMapApp {
             }
         }
 
-        let (doc, save_path, save_ok, screen) = if automation {
-            let (doc, ok) = match load_doc(&legacy) {
-                Some(doc) if !doc.text.trim().is_empty() => (doc, true),
-                _ => (sample_map(), false),
+        let (doc, canvas, save_path, save_ok, screen) = if automation {
+            let (doc, canvas, ok) = match load_file(&legacy) {
+                Some(Doc::Tree(node)) if !node.text.trim().is_empty() => (node, None, true),
+                Some(Doc::Canvas(c)) => (canvas_wrapper(&c.title), Some(c), true),
+                _ => (sample_map(), None, false),
             };
-            (doc, legacy, ok, Screen::Editor)
+            (doc, canvas, legacy, ok, Screen::Editor)
         } else {
-            (empty_map(), maps_dir.join("mindmap.json"), true, Screen::Home)
+            (
+                empty_map(),
+                None,
+                maps_dir.join("mindmap.json"),
+                true,
+                Screen::Home,
+            )
         };
 
-        let next_id = max_id(&doc) + 1;
-        let selected = doc.id;
+        let next_id = match &canvas {
+            Some(c) => c.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+            None => max_id(&doc) + 1,
+        };
+        let selected = match &canvas {
+            Some(c) => c.nodes.first().map(|n| n.id).unwrap_or(0),
+            None => doc.id,
+        };
         let home = scan_maps(&maps_dir);
 
         let mut app = Self {
             doc,
+            canvas,
             next_id,
             selected,
             editing: None,
@@ -867,6 +1096,10 @@ impl MindMapApp {
             drag: None,
             panning: false,
             hovered: None,
+            linking: false,
+            link_from: None,
+            resize: None,
+            resize_anchor: None,
             needs_fit: true,
             save_ok,
             save_path,
@@ -911,16 +1144,35 @@ impl MindMapApp {
 
     /// Открывает карту с диска в редакторе.
     fn open_map(&mut self, path: PathBuf) {
-        let Some(doc) = load_doc(&path) else {
+        let Some(doc) = load_file(&path) else {
             self.toast = Some(("Не удалось открыть карту".to_owned(), Instant::now()));
             return;
         };
-        self.doc = doc;
-        self.next_id = max_id(&self.doc) + 1;
-        self.selected = self.doc.id;
+        match doc {
+            Doc::Tree(node) => {
+                self.canvas = None;
+                self.doc = node;
+            }
+            Doc::Canvas(canvas) => {
+                self.doc = canvas_wrapper(&canvas.title);
+                self.canvas = Some(canvas);
+            }
+        }
+        self.next_id = match &self.canvas {
+            Some(canvas) => canvas.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+            None => max_id(&self.doc) + 1,
+        };
+        self.selected = match &self.canvas {
+            Some(canvas) => canvas.nodes.first().map(|n| n.id).unwrap_or(0),
+            None => self.doc.id,
+        };
         self.editing = None;
         self.drag = None;
         self.panning = false;
+        self.linking = false;
+        self.link_from = None;
+        self.resize = None;
+        self.resize_anchor = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.camera = Camera::default();
@@ -949,18 +1201,59 @@ impl MindMapApp {
     }
 
     fn save(&mut self) {
-        let json = match serde_json::to_string_pretty(&self.doc) {
-            Ok(json) => json,
-            Err(_) => {
-                self.save_ok = false;
-                return;
+        let json = if let Some(canvas) = &mut self.canvas {
+            canvas.title = self.doc.text.clone();
+            match serde_json::to_string_pretty(canvas) {
+                Ok(json) => json,
+                Err(_) => {
+                    self.save_ok = false;
+                    return;
+                }
+            }
+        } else {
+            match serde_json::to_string_pretty(&self.doc) {
+                Ok(json) => json,
+                Err(_) => {
+                    self.save_ok = false;
+                    return;
+                }
             }
         };
         self.save_ok = fs::write(&self.save_path, json).is_ok();
     }
 
+    /// Текущее состояние документа в виде снимка для истории отмены.
+    fn snapshot(&self) -> Snapshot {
+        match &self.canvas {
+            Some(canvas) => Snapshot::Canvas(canvas.clone()),
+            None => Snapshot::Tree(self.doc.clone()),
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot) {
+        match snap {
+            Snapshot::Tree(node) => {
+                self.canvas = None;
+                self.doc = node;
+            }
+            Snapshot::Canvas(canvas) => {
+                self.doc = canvas_wrapper(&canvas.title);
+                self.canvas = Some(canvas);
+            }
+        }
+    }
+
+    /// Раскладка текущего документа: холст, если открыт формат `canvas`,
+    /// иначе обычное дерево.
+    fn current_layout(&self, ctx: &egui::Context) -> Vec<Laid> {
+        match &self.canvas {
+            Some(canvas) => canvas_layout(canvas, ctx),
+            None => build_layout(&self.doc, ctx),
+        }
+    }
+
     fn push_undo(&mut self) {
-        self.undo_stack.push(self.doc.clone());
+        self.undo_stack.push(self.snapshot());
         if self.undo_stack.len() > 80 {
             self.undo_stack.remove(0);
         }
@@ -969,36 +1262,55 @@ impl MindMapApp {
 
     fn undo(&mut self) {
         if let Some(previous) = self.undo_stack.pop() {
-            self.redo_stack.push(self.doc.clone());
-            self.doc = previous;
+            self.redo_stack.push(self.snapshot());
+            self.restore(previous);
             self.after_history_change();
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(self.doc.clone());
-            self.doc = next;
+            self.undo_stack.push(self.snapshot());
+            self.restore(next);
             self.after_history_change();
         }
     }
 
     fn after_history_change(&mut self) {
-        if find(&self.doc, self.selected).is_none() {
-            self.selected = self.doc.id;
+        match &self.canvas {
+            Some(canvas) => {
+                if !canvas.nodes.iter().any(|n| n.id == self.selected) {
+                    self.selected = 0;
+                }
+                self.next_id = canvas.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+            }
+            None => {
+                if find(&self.doc, self.selected).is_none() {
+                    self.selected = self.doc.id;
+                }
+            }
         }
         self.editing = None;
         self.drag = None;
+        self.linking = false;
+        self.link_from = None;
+        self.resize = None;
+        self.resize_anchor = None;
         self.save();
     }
 
     fn new_map(&mut self) {
         self.doc = empty_map();
+        self.canvas = None;
         self.next_id = 2;
         self.selected = self.doc.id;
         self.editing = None;
         self.drag = None;
         self.panning = false;
+        self.linking = false;
+        self.link_from = None;
+        self.resize = None;
+        self.resize_anchor = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.camera = Camera::default();
@@ -1007,6 +1319,45 @@ impl MindMapApp {
         self.save_ok = true;
         self.screen = Screen::Editor;
         self.save();
+    }
+
+    /// Создаёт новый свободный холст с одной центральной темой.
+    fn new_canvas(&mut self) {
+        let mut canvas = CanvasDoc {
+            format: CANVAS_FORMAT.to_owned(),
+            title: "Чистый лист".to_owned(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        canvas.nodes.push(CanvasNode {
+            id: 1,
+            text: "Центральная тема".to_owned(),
+            x: 0.0,
+            y: 0.0,
+            w: 210.0,
+            h: 60.0,
+            color: 0,
+        });
+        self.doc = canvas_wrapper(&canvas.title);
+        self.canvas = Some(canvas);
+        self.next_id = 2;
+        self.selected = 1;
+        self.editing = None;
+        self.drag = None;
+        self.panning = false;
+        self.linking = false;
+        self.link_from = None;
+        self.resize = None;
+        self.resize_anchor = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.camera = Camera::default();
+        self.needs_fit = true;
+        self.save_path = new_map_path(&self.maps_dir);
+        self.save_ok = true;
+        self.screen = Screen::Editor;
+        self.save();
+        self.begin_edit(1);
     }
 
     fn add_child(&mut self, parent_id: u64) {
@@ -1058,11 +1409,19 @@ impl MindMapApp {
         {
             self.commit_edit();
         }
-        if let Some(found) = find(&self.doc, id) {
+        let text = match &self.canvas {
+            Some(canvas) => canvas
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.text.clone()),
+            None => find(&self.doc, id).map(|n| n.text.clone()),
+        };
+        if let Some(text) = text {
             self.selected = id;
             self.editing = Some(EditState {
                 id,
-                text: found.text.clone(),
+                text,
                 select_all: true,
             });
         }
@@ -1078,6 +1437,29 @@ impl MindMapApp {
         } else {
             cleaned
         };
+        if self.canvas.is_some() {
+            let changed = self
+                .canvas
+                .as_ref()
+                .map(|c| {
+                    c.nodes
+                        .iter()
+                        .any(|n| n.id == edit.id && n.text != final_text)
+                })
+                .unwrap_or(false);
+            if changed {
+                self.push_undo();
+                if let Some(n) = self
+                    .canvas
+                    .as_mut()
+                    .and_then(|c| c.nodes.iter_mut().find(|n| n.id == edit.id))
+                {
+                    n.text = final_text;
+                }
+                self.save();
+            }
+            return;
+        }
         let changed = find(&self.doc, edit.id)
             .map(|n| n.text != final_text)
             .unwrap_or(false);
@@ -1088,6 +1470,79 @@ impl MindMapApp {
             }
             self.save();
         }
+    }
+
+    // ------------------------------------------------------ свободный холст --
+
+    /// Добавляет новый узел в центр текущего вида.
+    fn add_canvas_node(&mut self) {
+        if self.canvas.is_none() {
+            return;
+        }
+        self.push_undo();
+        let id = self.next_id;
+        self.next_id += 1;
+        let center = Pos2::new(-self.camera.pan.x, -self.camera.pan.y);
+        let offset = ((id % 5) as f32 - 2.0) * 26.0;
+        let color = (id as usize) % BRANCH.len();
+        if let Some(canvas) = &mut self.canvas {
+            canvas.nodes.push(CanvasNode {
+                id,
+                text: "Новый узел".to_owned(),
+                x: center.x + offset,
+                y: center.y + offset,
+                w: 170.0,
+                h: 52.0,
+                color,
+            });
+        }
+        self.selected = id;
+        self.save();
+        self.begin_edit(id);
+    }
+
+    /// Удаляет узел холста вместе со всеми его связями.
+    fn delete_canvas_node(&mut self, id: u64) {
+        let Some(canvas) = &self.canvas else {
+            return;
+        };
+        if !canvas.nodes.iter().any(|n| n.id == id) {
+            return;
+        }
+        self.push_undo();
+        if let Some(canvas) = &mut self.canvas {
+            canvas.nodes.retain(|n| n.id != id);
+            canvas.edges.retain(|e| e.from != id && e.to != id);
+        }
+        self.selected = 0;
+        self.editing = None;
+        self.drag = None;
+        self.link_from = None;
+        self.save();
+    }
+
+    /// Создаёт связь между двумя узлами холста, если её ещё нет.
+    fn link_canvas(&mut self, from: u64, to: u64) {
+        if from == to {
+            return;
+        }
+        let Some(canvas) = &self.canvas else {
+            return;
+        };
+        let exists = canvas
+            .edges
+            .iter()
+            .any(|e| (e.from == from && e.to == to) || (e.from == to && e.to == from));
+        let valid =
+            canvas.nodes.iter().any(|n| n.id == from) && canvas.nodes.iter().any(|n| n.id == to);
+        if exists || !valid {
+            return;
+        }
+        self.push_undo();
+        if let Some(canvas) = &mut self.canvas {
+            canvas.edges.push(CanvasEdge { from, to });
+        }
+        self.save();
     }
 
     fn perform_reparent(&mut self, id: u64, target: Option<u64>) {
@@ -1150,8 +1605,19 @@ impl MindMapApp {
                 let parent = self.selected;
                 self.add_child(parent);
             }
+            Action::AddNode => self.add_canvas_node(),
+            Action::ToggleLink => {
+                self.linking = !self.linking;
+                self.link_from = None;
+            }
             Action::NewMap => self.new_map(),
-            Action::Delete => self.delete_selected(),
+            Action::Delete => {
+                if self.canvas.is_some() {
+                    self.delete_canvas_node(self.selected);
+                } else {
+                    self.delete_selected();
+                }
+            }
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
             Action::Home => self.go_home(ctx),
@@ -1219,7 +1685,7 @@ impl MindMapApp {
     }
 
     fn export_pdf(&mut self, ctx: &egui::Context, path: &Path) -> Result<PathBuf, String> {
-        let layout = build_layout(&self.doc, ctx);
+        let layout = self.current_layout(ctx);
         if layout.is_empty() {
             return Err("карта пуста".to_owned());
         }
@@ -1283,42 +1749,35 @@ impl MindMapApp {
         // Связи между узлами.
         let rects: HashMap<u64, Rect> = layout.iter().map(|l| (l.id, l.rect)).collect();
         for laid in &layout {
-            let Some(parent_id) = laid.parent else {
+            if laid.parents.is_empty() {
+                continue;
+            }
+            let Some(child) = rects.get(&laid.id).copied() else {
                 continue;
             };
-            let Some(parent) = rects.get(&parent_id).copied() else {
-                continue;
-            };
-            let child = laid.rect;
-            let (p0, p3) = if child.center().x >= parent.center().x {
-                (
-                    Pos2::new(parent.right() - 1.0, parent.center().y),
-                    Pos2::new(child.left() + 1.0, child.center().y),
-                )
-            } else {
-                (
-                    Pos2::new(parent.left() + 1.0, parent.center().y),
-                    Pos2::new(child.right() - 1.0, child.center().y),
-                )
-            };
-            let dx = (p3.x - p0.x) * 0.55;
-            ops.push(PdfOp::SetOutlineColor {
-                col: pdf_rgb(pal.branch(laid.color)),
-            });
-            ops.push(PdfOp::SetOutlineThickness {
-                pt: PdfPt((1.8 * scale).max(0.8)),
-            });
-            ops.push(PdfOp::DrawLine {
-                line: PdfLine {
-                    points: vec![
-                        pdf_line_point(map_x(p0.x), map_y(p0.y), false),
-                        pdf_line_point(map_x(p0.x + dx), map_y(p0.y), true),
-                        pdf_line_point(map_x(p3.x - dx), map_y(p3.y), true),
-                        pdf_line_point(map_x(p3.x), map_y(p3.y), false),
-                    ],
-                    is_closed: false,
-                },
-            });
+            for &parent_id in &laid.parents {
+                let Some(parent) = rects.get(&parent_id).copied() else {
+                    continue;
+                };
+                let [p0, c1, c2, p3] = edge_curve(parent, child);
+                ops.push(PdfOp::SetOutlineColor {
+                    col: pdf_rgb(pal.branch(laid.color)),
+                });
+                ops.push(PdfOp::SetOutlineThickness {
+                    pt: PdfPt((1.8 * scale).max(0.8)),
+                });
+                ops.push(PdfOp::DrawLine {
+                    line: PdfLine {
+                        points: vec![
+                            pdf_line_point(map_x(p0.x), map_y(p0.y), false),
+                            pdf_line_point(map_x(c1.x), map_y(c1.y), true),
+                            pdf_line_point(map_x(c2.x), map_y(c2.y), true),
+                            pdf_line_point(map_x(p3.x), map_y(p3.y), false),
+                        ],
+                        is_closed: false,
+                    },
+                });
+            }
         }
 
         // Узлы.
@@ -1423,6 +1882,7 @@ impl MindMapApp {
         let mut new_map = false;
         let mut fit = false;
         let mut export = false;
+        let mut escape = false;
         let shift_cmd = Modifiers {
             command: true,
             shift: true,
@@ -1440,6 +1900,7 @@ impl MindMapApp {
             delete = i.consume_key(Modifiers::NONE, Key::Delete)
                 || i.consume_key(Modifiers::NONE, Key::Backspace);
             edit = i.consume_key(Modifiers::NONE, Key::F2);
+            escape = i.consume_key(Modifiers::NONE, Key::Escape);
         });
 
         if undo {
@@ -1457,6 +1918,26 @@ impl MindMapApp {
         if export {
             self.apply_action(Action::ExportPdf, ctx);
         }
+
+        if self.canvas.is_some() {
+            if escape {
+                self.linking = false;
+                self.link_from = None;
+            }
+            if add_child || add_sibling {
+                self.add_canvas_node();
+                return;
+            }
+            if edit {
+                self.begin_edit(self.selected);
+                return;
+            }
+            if delete {
+                self.delete_canvas_node(self.selected);
+            }
+            return;
+        }
+
         if add_child {
             let parent = self.selected;
             self.add_child(parent);
@@ -1485,8 +1966,9 @@ impl MindMapApp {
         }
 
         let pal = self.pal;
+        let is_canvas = self.canvas.is_some();
 
-        let layout = build_layout(&self.doc, ctx);
+        let layout = self.current_layout(ctx);
         if self.needs_fit {
             let size = canvas_rect.size();
             self.fit_to(&layout, size);
@@ -1503,13 +1985,16 @@ impl MindMapApp {
             .unwrap_or(false);
 
         if bg.drag_started() {
-            self.panning = !over_node && self.drag.is_none();
+            self.panning = !over_node && self.drag.is_none() && self.resize.is_none();
         }
         if bg.dragged() && self.panning {
             self.camera.pan += bg.drag_delta() / self.camera.zoom;
         }
         if bg.drag_stopped() {
             self.panning = false;
+        }
+        if is_canvas && self.linking && bg.clicked() {
+            self.link_from = None;
         }
 
         if let Some(pointer) = pointer_pos {
@@ -1564,41 +2049,37 @@ impl MindMapApp {
 
         // Connections.
         for laid in &layout {
-            let Some(parent_id) = laid.parent else {
+            if laid.parents.is_empty() {
                 continue;
-            };
-            let Some(pr) = rects.get(&parent_id).copied() else {
-                continue;
-            };
+            }
             let Some(cr_) = rects.get(&laid.id).copied() else {
                 continue;
             };
-            let (p0, p3) = if cr_.center().x >= pr.center().x {
-                (
-                    Pos2::new(pr.right() - 1.0, pr.center().y),
-                    Pos2::new(cr_.left() + 1.0, cr_.center().y),
-                )
-            } else {
-                (
-                    Pos2::new(pr.left() + 1.0, pr.center().y),
-                    Pos2::new(cr_.right() - 1.0, cr_.center().y),
-                )
-            };
-            let dx = (p3.x - p0.x) * 0.55;
-            let color = pal.branch(laid.color);
-            let stroke = Stroke::new((2.0 * camera.zoom).clamp(1.1, 2.8), with_alpha(color, 175));
-            let curve = egui::epaint::CubicBezierShape::from_points_stroke(
-                [
-                    p0,
-                    Pos2::new(p0.x + dx, p0.y),
-                    Pos2::new(p3.x - dx, p3.y),
-                    p3,
-                ],
-                false,
-                Color32::TRANSPARENT,
-                stroke,
-            );
-            painter.add(curve);
+            for &parent_id in &laid.parents {
+                let Some(pr) = rects.get(&parent_id).copied() else {
+                    continue;
+                };
+                let [p0, c1, c2, p3] = edge_curve(pr, cr_);
+                let color = pal.branch(laid.color);
+                let stroke =
+                    Stroke::new((2.0 * camera.zoom).clamp(1.1, 2.8), with_alpha(color, 175));
+                let curve = egui::epaint::CubicBezierShape::from_points_stroke(
+                    [p0, c1, c2, p3],
+                    false,
+                    Color32::TRANSPARENT,
+                    stroke,
+                );
+                painter.add(curve);
+                if is_canvas {
+                    draw_arrowhead(
+                        &painter,
+                        p3,
+                        p3 - c2,
+                        (11.0 * camera.zoom).clamp(7.0, 15.0),
+                        with_alpha(color, 220),
+                    );
+                }
+            }
         }
 
         // Nodes.
@@ -1619,23 +2100,56 @@ impl MindMapApp {
         }
 
         // Node interaction.
+        let to_world = |p: Pos2| (p - canvas_rect.center()) / camera.zoom - camera.pan;
         let mut drag_stopped = false;
+        let mut resize_stopped = false;
         let mut hovered = None;
+        let mut hover_handle = false;
         for laid in &layout {
             let Some(rect) = rects.get(&laid.id).copied() else {
                 continue;
             };
+            let handle = resize_handle_rect(rect);
+            let on_handle = is_canvas
+                && self.selected == laid.id
+                && pointer_pos
+                    .map(|p| handle.expand(2.0).contains(p))
+                    .unwrap_or(false);
             let response = ui.interact(rect, Id::new(("node", laid.id)), Sense::click_and_drag());
             if response.hovered() && self.drag.is_none() {
                 hovered = Some(laid.id);
             }
+
+            if is_canvas && self.linking {
+                if response.clicked() {
+                    match self.link_from {
+                        None => {
+                            self.link_from = Some(laid.id);
+                            self.selected = laid.id;
+                        }
+                        Some(from) if from == laid.id => self.link_from = None,
+                        Some(from) => {
+                            self.link_canvas(from, laid.id);
+                            self.link_from = None;
+                            self.selected = laid.id;
+                        }
+                    }
+                }
+                continue;
+            }
+
             if response.clicked() {
                 self.selected = laid.id;
             }
             if response.double_clicked() {
                 self.begin_edit(laid.id);
             }
-            if response.drag_started() {
+            if response.drag_started() && !on_handle {
+                if is_canvas {
+                    self.push_undo();
+                    self.resize = None;
+                    self.resize_anchor = None;
+                }
                 self.selected = laid.id;
                 self.drag = Some(laid.id);
                 self.panning = false;
@@ -1643,67 +2157,175 @@ impl MindMapApp {
             if response.drag_stopped() {
                 drag_stopped = true;
             }
+
+            // Уголок изменения размера у выбранного узла холста.
+            if is_canvas && self.selected == laid.id {
+                let hresp = ui.interact(handle, Id::new(("resize", laid.id)), Sense::drag());
+                if hresp.hovered() {
+                    hovered = Some(laid.id);
+                    hover_handle = true;
+                }
+                if hresp.drag_started() {
+                    self.push_undo();
+                    self.selected = laid.id;
+                    self.resize = Some(laid.id);
+                    self.resize_anchor = Some(Pos2::new(laid.rect.left(), laid.rect.top()));
+                    self.drag = None;
+                    self.panning = false;
+                }
+                if hresp.drag_stopped() {
+                    resize_stopped = true;
+                }
+            }
         }
         self.hovered = hovered;
 
-        let drop_target = self.drop_target(&layout, &rects, pointer_pos, canvas_rect);
-
-        if drag_stopped {
-            if let Some(id) = self.drag.take() {
-                self.perform_reparent(id, drop_target);
+        if is_canvas {
+            // Изменение размера: верхний-левый угол рамки остаётся на месте.
+            if let Some(id) = self.resize
+                && let (Some(pointer), Some(anchor)) = (pointer_pos, self.resize_anchor)
+            {
+                let wp = to_world(pointer);
+                let w = (wp.x - anchor.x).max(MIN_NODE_W);
+                let h = (wp.y - anchor.y).max(MIN_NODE_H);
+                if let Some(node) = self
+                    .canvas
+                    .as_mut()
+                    .and_then(|c| c.nodes.iter_mut().find(|n| n.id == id))
+                {
+                    node.w = w;
+                    node.h = h;
+                    node.x = anchor.x + w * 0.5;
+                    node.y = anchor.y + h * 0.5;
+                }
             }
-        }
 
-        // Drop highlight.
-        if let (Some(target), Some(_)) = (drop_target, self.drag) {
-            if let Some(rect) = rects.get(&target).copied() {
-                let laid = layout.iter().find(|l| l.id == target);
-                let radius = laid.map(|l| self.node_radius(l.depth)).unwrap_or(10.0);
+            // Перемещение узла вслед за курсором.
+            if let Some(id) = self.drag
+                && let Some(pointer) = pointer_pos
+            {
+                let wp = to_world(pointer);
+                if let Some(node) = self
+                    .canvas
+                    .as_mut()
+                    .and_then(|c| c.nodes.iter_mut().find(|n| n.id == id))
+                {
+                    node.x = wp.x;
+                    node.y = wp.y;
+                }
+            }
+
+            if drag_stopped {
+                self.drag = None;
+                self.save();
+            }
+            if resize_stopped {
+                self.resize = None;
+                self.resize_anchor = None;
+                self.save();
+            }
+
+            // Ручка изменения размера у выбранного узла.
+            if let Some(rect) = rects.get(&self.selected).copied() {
+                let handle = resize_handle_rect(rect);
+                painter.rect_filled(handle, cr(3.0), pal.accent);
                 painter.rect_stroke(
-                    rect.expand(4.0),
-                    cr(radius + 3.0),
-                    Stroke::new(2.6, pal.accent),
-                    StrokeKind::Outside,
+                    handle,
+                    cr(3.0),
+                    Stroke::new(1.5, pal.on_color),
+                    StrokeKind::Inside,
                 );
             }
-        }
 
-        // Dragged topic ghost.
-        if let (Some(id), Some(pointer)) = (self.drag, pointer_pos) {
-            if let Some(laid) = layout.iter().find(|l| l.id == id) {
-                if let Some(rect) = rects.get(&id).copied() {
-                    let size = rect.size() * 0.96;
-                    let ghost = Rect::from_center_size(pointer + Vec2::new(0.0, -6.0), size);
-                    let color = pal.branch(laid.color);
-                    let fill = pal.node_fill(laid.depth, color);
-                    painter.rect_filled(
-                        ghost.translate(Vec2::new(0.0, 5.0)),
-                        cr(self.node_radius(laid.depth)),
-                        Color32::from_black_alpha(35),
+            // Резиновая связь в режиме соединения.
+            if self.linking
+                && let (Some(from), Some(pointer)) = (self.link_from, pointer_pos)
+                && let Some(rect) = rects.get(&from).copied()
+            {
+                painter.line_segment(
+                    [rect.center(), pointer],
+                    Stroke::new(
+                        (2.0 * camera.zoom).clamp(1.2, 2.6),
+                        with_alpha(pal.accent, 200),
+                    ),
+                );
+                painter.circle_filled(pointer, 3.5, pal.accent);
+            }
+
+            // Подсказка на пустом холсте.
+            if layout.is_empty() {
+                painter.text(
+                    canvas_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Холст пуст · нажмите «+ Узел»",
+                    FontId::proportional(15.0),
+                    pal.muted,
+                );
+            }
+        } else {
+            let drop_target = self.drop_target(&layout, &rects, pointer_pos, canvas_rect);
+
+            if drag_stopped {
+                if let Some(id) = self.drag.take() {
+                    self.perform_reparent(id, drop_target);
+                }
+            }
+
+            // Drop highlight.
+            if let (Some(target), Some(_)) = (drop_target, self.drag) {
+                if let Some(rect) = rects.get(&target).copied() {
+                    let laid = layout.iter().find(|l| l.id == target);
+                    let radius = laid.map(|l| self.node_radius(l.depth)).unwrap_or(10.0);
+                    painter.rect_stroke(
+                        rect.expand(4.0),
+                        cr(radius + 3.0),
+                        Stroke::new(2.6, pal.accent),
+                        StrokeKind::Outside,
                     );
-                    painter.rect(
-                        ghost,
-                        cr(self.node_radius(laid.depth)),
-                        with_alpha(fill, 235),
-                        Stroke::new(1.2, with_alpha(color, 160)),
-                        StrokeKind::Inside,
-                    );
-                    let text_color = pal.node_text(laid.depth);
-                    let font = laid_font(laid.depth) * camera.zoom;
-                    painter.text(
-                        ghost.center(),
-                        Align2::CENTER_CENTER,
-                        elide(&laid.text, 26),
-                        FontId::proportional(font),
-                        text_color,
-                    );
+                }
+            }
+
+            // Dragged topic ghost.
+            if let (Some(id), Some(pointer)) = (self.drag, pointer_pos) {
+                if let Some(laid) = layout.iter().find(|l| l.id == id) {
+                    if let Some(rect) = rects.get(&id).copied() {
+                        let size = rect.size() * 0.96;
+                        let ghost = Rect::from_center_size(pointer + Vec2::new(0.0, -6.0), size);
+                        let color = pal.branch(laid.color);
+                        let fill = pal.node_fill(laid.depth, color);
+                        painter.rect_filled(
+                            ghost.translate(Vec2::new(0.0, 5.0)),
+                            cr(self.node_radius(laid.depth)),
+                            Color32::from_black_alpha(35),
+                        );
+                        painter.rect(
+                            ghost,
+                            cr(self.node_radius(laid.depth)),
+                            with_alpha(fill, 235),
+                            Stroke::new(1.2, with_alpha(color, 160)),
+                            StrokeKind::Inside,
+                        );
+                        let text_color = pal.node_text(laid.depth);
+                        let font = laid_font(laid.depth) * camera.zoom;
+                        painter.text(
+                            ghost.center(),
+                            Align2::CENTER_CENTER,
+                            elide(&laid.text, 26),
+                            FontId::proportional(font),
+                            text_color,
+                        );
+                    }
                 }
             }
         }
 
         if let Some(pointer) = pointer_pos {
             if canvas_rect.contains(pointer) {
-                if self.drag.is_some() || self.panning {
+                if is_canvas && self.linking {
+                    ctx.set_cursor_icon(CursorIcon::Crosshair);
+                } else if hover_handle {
+                    ctx.set_cursor_icon(CursorIcon::ResizeNwSe);
+                } else if self.drag.is_some() || self.resize.is_some() || self.panning {
                     ctx.set_cursor_icon(CursorIcon::Grabbing);
                 } else if self.hovered.is_some() {
                     ctx.set_cursor_icon(CursorIcon::PointingHand);
@@ -1807,10 +2429,20 @@ impl MindMapApp {
             1 => 20.0,
             _ => 17.0,
         };
-        let max_chars = (((rect.width() - 2.0 * pad) / (size * 0.56)).floor() as usize).max(3);
-        let text = elide(&laid.text, max_chars);
         let clipped = painter.with_clip_rect(rect.shrink(2.0));
-        let galley = clipped.layout_no_wrap(text, FontId::proportional(size), text_color);
+        let galley = if laid.wrap {
+            let wrap_w = (rect.width() - 2.0 * pad).max(12.0);
+            clipped.layout(
+                laid.text.clone(),
+                FontId::proportional(size),
+                text_color,
+                wrap_w,
+            )
+        } else {
+            let max_chars = (((rect.width() - 2.0 * pad) / (size * 0.56)).floor() as usize).max(3);
+            let text = elide(&laid.text, max_chars);
+            clipped.layout_no_wrap(text, FontId::proportional(size), text_color)
+        };
         clipped.galley(rect.center() - galley.size() * 0.5, galley, text_color);
     }
 
@@ -1958,6 +2590,7 @@ impl MindMapApp {
         let mut delete: Option<PathBuf> = None;
         let mut toggle = false;
         let mut make_new = false;
+        let mut make_canvas = false;
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.canvas))
@@ -2006,10 +2639,33 @@ impl MindMapApp {
                                     .color(pal.muted),
                             );
                             ui.add_space(20.0);
-                            if pill_button(ui, &pal, "+ Новая карта", true, 190.0, "Создать карту")
-                            {
-                                make_new = true;
-                            }
+                            let btn_w = 176.0;
+                            let pad =
+                                ((ui.available_width() - (btn_w * 2.0 + 10.0)) * 0.5).max(0.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(pad);
+                                if pill_button(
+                                    ui,
+                                    &pal,
+                                    "+ Новая карта",
+                                    true,
+                                    btn_w,
+                                    "Создать обычную карту-дерево",
+                                ) {
+                                    make_new = true;
+                                }
+                                ui.add_space(10.0);
+                                if pill_button(
+                                    ui,
+                                    &pal,
+                                    "+ Чистый лист",
+                                    false,
+                                    btn_w,
+                                    "Свободный холст: любые узлы и связи",
+                                ) {
+                                    make_canvas = true;
+                                }
+                            });
                             ui.add_space(22.0);
 
                             Frame::new()
@@ -2068,6 +2724,9 @@ impl MindMapApp {
         if make_new {
             self.new_map();
         }
+        if make_canvas {
+            self.new_canvas();
+        }
         if let Some(path) = delete {
             self.delete_map(&path);
         }
@@ -2081,18 +2740,31 @@ impl MindMapApp {
     fn top_bar(&mut self, root_ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut actions: Vec<Action> = Vec::new();
         let pal = self.pal;
+        let is_canvas = self.canvas.is_some();
         let can_undo = !self.undo_stack.is_empty();
         let can_redo = !self.redo_stack.is_empty();
-        let can_delete = self.selected != self.doc.id;
-        let title = elide(&self.doc.text, 42);
-        let default_subtitle = if self.save_ok {
-            "Простая карта · сохранено"
+        let can_delete = if is_canvas {
+            self.canvas
+                .as_ref()
+                .map(|c| c.nodes.iter().any(|n| n.id == self.selected))
+                .unwrap_or(false)
         } else {
-            "Простая карта · сохранение недоступно"
+            self.selected != self.doc.id
+        };
+        let title = elide(&self.doc.text, 42);
+        let kind = if is_canvas {
+            "Свободный холст"
+        } else {
+            "Простая карта"
+        };
+        let default_subtitle = if self.save_ok {
+            format!("{kind} · сохранено")
+        } else {
+            format!("{kind} · сохранение недоступно")
         };
         let subtitle = match &self.toast {
             Some((msg, at)) if at.elapsed().as_secs_f32() < 6.0 => msg.clone(),
-            _ => default_subtitle.to_owned(),
+            _ => default_subtitle,
         };
 
         egui::Panel::top("top_bar")
@@ -2129,7 +2801,23 @@ impl MindMapApp {
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if pill_button(ui, &pal, "+ Ветка", true, 102.0, "Добавить ветку (Tab)") {
+                        if is_canvas {
+                            if toggle_pill(
+                                ui,
+                                &pal,
+                                "Связь",
+                                self.linking,
+                                86.0,
+                                "Режим соединения: клик по двум узлам",
+                            ) {
+                                actions.push(Action::ToggleLink);
+                            }
+                            if pill_button(ui, &pal, "+ Узел", true, 96.0, "Добавить узел (Tab)")
+                            {
+                                actions.push(Action::AddNode);
+                            }
+                        } else if pill_button(ui, &pal, "+ Ветка", true, 102.0, "Добавить ветку (Tab)")
+                        {
                             actions.push(Action::AddChild);
                         }
                         if pill_button(ui, &pal, "Новая", false, 74.0, "Новая карта (Cmd+N)") {
@@ -2144,7 +2832,12 @@ impl MindMapApp {
                             ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
                         ui.painter().rect_filled(line, 0, pal.border);
                         ui.add_space(6.0);
-                        if icon_button(ui, &pal, Icon::Trash, can_delete, "Удалить ветку (Delete)") {
+                        let delete_tip = if is_canvas {
+                            "Удалить узел (Delete)"
+                        } else {
+                            "Удалить ветку (Delete)"
+                        };
+                        if icon_button(ui, &pal, Icon::Trash, can_delete, delete_tip) {
                             actions.push(Action::Delete);
                         }
                         if icon_button(ui, &pal, Icon::Redo, can_redo, "Повторить (Cmd+Shift+Z)") {
@@ -2179,6 +2872,11 @@ impl MindMapApp {
         let mut actions: Vec<Action> = Vec::new();
         let pal = self.pal;
         let zoom = self.camera.zoom;
+        let hint = if self.canvas.is_some() {
+            "Перетащите узел · угол — размер · «Связь» — соединить · Tab — узел · двойной клик — текст · Delete — узел"
+        } else {
+            "Tab — ветка · Enter — ещё одна · Delete — удалить · двойной клик — изменить · Cmd+P — PDF"
+        };
         let _ = ctx;
 
         egui::Panel::bottom("bottom_bar")
@@ -2197,13 +2895,7 @@ impl MindMapApp {
                 );
 
                 ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "Tab — ветка · Enter — ещё одна · Delete — удалить · двойной клик — изменить · Cmd+P — PDF",
-                        )
-                        .size(11.0)
-                        .color(pal.muted),
-                    );
+                    ui.label(RichText::new(hint).size(11.0).color(pal.muted));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if pill_button(ui, &pal, "По размеру", false, 92.0, "Вписать карту в окно (F)") {
@@ -2320,15 +3012,28 @@ fn map_row(ui: &mut egui::Ui, pal: &Palette, entry: &MapEntry) -> RowAction {
     painter.rect_filled(icon, cr(10.0), pal.navy);
     let center = icon.center();
     let branch = mix(pal.navy, WHITE, 0.55);
-    for tip in [
-        center + Vec2::new(8.0, -6.0),
-        center + Vec2::new(9.5, 0.0),
-        center + Vec2::new(8.0, 6.0),
-    ] {
-        painter.line_segment([center, tip], Stroke::new(1.3, branch));
-        painter.circle_filled(tip, 1.6, branch);
+    if entry.canvas {
+        // Мини-иконка свободного холста: несколько узлов и связь между ними.
+        let a = center + Vec2::new(-6.5, -6.0);
+        let b = center + Vec2::new(7.0, -3.0);
+        let c = center + Vec2::new(-3.0, 7.0);
+        for (p, q) in [(a, b), (a, c), (b, c)] {
+            painter.line_segment([p, q], Stroke::new(1.2, branch));
+        }
+        for p in [a, b, c] {
+            painter.circle_filled(p, 2.4, pal.on_color);
+        }
+    } else {
+        for tip in [
+            center + Vec2::new(8.0, -6.0),
+            center + Vec2::new(9.5, 0.0),
+            center + Vec2::new(8.0, 6.0),
+        ] {
+            painter.line_segment([center, tip], Stroke::new(1.3, branch));
+            painter.circle_filled(tip, 1.6, branch);
+        }
+        painter.circle_filled(center, 2.2, pal.on_color);
     }
-    painter.circle_filled(center, 2.2, pal.on_color);
 
     let text_left = icon.right() + 14.0;
     let max_title = ((delete_rect.left() - text_left - 12.0) / 7.4).max(8.0) as usize;
@@ -2339,12 +3044,20 @@ fn map_row(ui: &mut egui::Ui, pal: &Palette, entry: &MapEntry) -> RowAction {
         FontId::proportional(14.5),
         pal.heading,
     );
-    let sub = format!(
-        "{} · {} · изменено {}",
-        branches_label(entry.branches),
-        nodes_label(entry.nodes),
-        relative_time(entry.modified)
-    );
+    let sub = if entry.canvas {
+        format!(
+            "Свободный холст · {} · изменено {}",
+            nodes_label(entry.nodes),
+            relative_time(entry.modified)
+        )
+    } else {
+        format!(
+            "{} · {} · изменено {}",
+            branches_label(entry.branches),
+            nodes_label(entry.nodes),
+            relative_time(entry.modified)
+        )
+    };
     painter.text(
         Pos2::new(text_left, rect.center().y + 11.0),
         Align2::LEFT_CENTER,
@@ -2392,6 +3105,42 @@ fn pill_button(
     if !primary && response.hovered() {
         ui.painter()
             .rect_stroke(rect, cr(10.0), Stroke::new(1.0, pal.border), StrokeKind::Inside);
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, color);
+    response.clicked()
+}
+
+/// Кнопка-переключатель: подсвечивается, когда режим включён.
+fn toggle_pill(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    label: &str,
+    active: bool,
+    min_width: f32,
+    tip: &str,
+) -> bool {
+    let font = FontId::proportional(13.5);
+    let color = if active { pal.on_color } else { pal.text };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let width = (galley.size().x + 30.0).max(min_width);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+    let response = response.on_hover_text(tip);
+    let fill = if active {
+        pal.accent
+    } else if response.hovered() {
+        pal.soft
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, cr(10.0), fill);
+    if !active && response.hovered() {
+        ui.painter().rect_stroke(
+            rect,
+            cr(10.0),
+            Stroke::new(1.0, pal.border),
+            StrokeKind::Inside,
+        );
     }
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, color);
@@ -2613,5 +3362,60 @@ mod tests {
         assert_eq!(restored.text, "Моя карта");
         assert_eq!(restored.children.len(), 4);
         assert_eq!(max_id(&restored), 14);
+    }
+
+    #[test]
+    fn canvas_serde_roundtrip() {
+        let canvas = CanvasDoc {
+            format: CANVAS_FORMAT.to_owned(),
+            title: "Чистый лист".to_owned(),
+            nodes: vec![
+                CanvasNode {
+                    id: 1,
+                    text: "A".to_owned(),
+                    x: 0.0,
+                    y: 0.0,
+                    w: 120.0,
+                    h: 50.0,
+                    color: 0,
+                },
+                CanvasNode {
+                    id: 2,
+                    text: "B".to_owned(),
+                    x: 200.0,
+                    y: 40.0,
+                    w: 140.0,
+                    h: 60.0,
+                    color: 1,
+                },
+            ],
+            edges: vec![CanvasEdge { from: 1, to: 2 }],
+        };
+        let text = serde_json::to_string(&canvas).unwrap();
+        match load_file_str(&text).expect("разбирается") {
+            Doc::Canvas(restored) => {
+                assert_eq!(restored.nodes.len(), 2);
+                assert_eq!(restored.edges.len(), 1);
+                assert_eq!(restored.nodes[1].w, 140.0);
+                assert_eq!(restored.title, "Чистый лист");
+            }
+            Doc::Tree(_) => panic!("ожидался свободный холст"),
+        }
+    }
+
+    #[test]
+    fn tree_file_still_parses_as_tree() {
+        let text = serde_json::to_string(&sample_map()).unwrap();
+        assert!(matches!(load_file_str(&text), Some(Doc::Tree(_))));
+    }
+
+    #[test]
+    fn edge_curve_connects_facing_sides() {
+        let a = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 40.0));
+        let b = Rect::from_min_size(Pos2::new(300.0, 0.0), Vec2::new(100.0, 40.0));
+        let [p0, _, _, p3] = edge_curve(a, b);
+        assert!(p0.x > a.center().x);
+        assert!(p3.x < b.center().x);
+        assert!((p0.y - a.center().y).abs() < 0.001);
     }
 }
