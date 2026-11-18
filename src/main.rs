@@ -16,6 +16,8 @@ use printpdf::{
 use serde::{Deserialize, Serialize};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+mod git;
+
 // ---------------------------------------------------------------- palette ---
 
 const WHITE: Color32 = Color32::WHITE;
@@ -203,6 +205,29 @@ struct CanvasEdge {
     to: u64,
 }
 
+/// Маркер формата карты-графа. Обычные карты-деревья его не содержат.
+const GRAPH_FORMAT: &str = "git-graph";
+
+/// Узел карты-графа: подпись и координаты в мировых точках.
+#[derive(Clone, Serialize, Deserialize)]
+struct GraphNode {
+    id: u64,
+    text: String,
+    x: f32,
+    y: f32,
+    #[serde(default)]
+    color: usize,
+    #[serde(default)]
+    root: bool,
+}
+
+/// Ребро карты-графа: `from` — ребёнок (новее), `to` — родитель (старее).
+#[derive(Clone, Serialize, Deserialize)]
+struct GraphEdge {
+    from: u64,
+    to: u64,
+}
+
 /// Второй формат карты — свободный холст: узлы лежат где угодно и связаны
 /// произвольными рёбрами. В отличие от дерева [`Node`], иерархии здесь нет.
 #[derive(Clone, Serialize, Deserialize)]
@@ -214,10 +239,23 @@ struct CanvasDoc {
     edges: Vec<CanvasEdge>,
 }
 
-/// Документ карты с диска: обычное дерево или свободный холст.
+/// Третий формат карты — граф (используется для истории Git). В отличие от
+/// дерева [`Node`], здесь узлы свободно расположены, а связи заданы рёбрами,
+/// поэтому ветки могут сходиться в точках слияния.
+#[derive(Clone, Serialize, Deserialize)]
+struct GraphDoc {
+    format: String,
+    title: String,
+    nodes: Vec<GraphNode>,
+    #[serde(default)]
+    edges: Vec<GraphEdge>,
+}
+
+/// Документ карты с диска: обычное дерево, свободный холст или граф.
 enum Doc {
     Tree(Node),
     Canvas(CanvasDoc),
+    Graph(GraphDoc),
 }
 
 /// Снимок документа для истории отмены.
@@ -225,6 +263,7 @@ enum Doc {
 enum Snapshot {
     Tree(Node),
     Canvas(CanvasDoc),
+    Graph(GraphDoc),
 }
 
 #[derive(Clone)]
@@ -292,8 +331,10 @@ struct MapEntry {
     title: String,
     branches: usize,
     nodes: usize,
-    /// `true` для свободного холста, `false` для карты-дерева.
+    /// `true` для свободного холста, `false` для карты-дерева и графа.
     canvas: bool,
+    /// `true` для карты-графа (история Git).
+    graph: bool,
     modified: Option<SystemTime>,
 }
 
@@ -327,6 +368,8 @@ struct MindMapApp {
     doc: Node,
     /// Открытый свободный холст (если текущая карта формата `canvas`).
     canvas: Option<CanvasDoc>,
+    /// Загруженный граф (если открыта карта формата `git-graph`).
+    graph: Option<GraphDoc>,
     next_id: u64,
     selected: u64,
     editing: Option<EditState>,
@@ -648,6 +691,34 @@ fn canvas_layout(canvas: &CanvasDoc, ctx: &egui::Context) -> Vec<Laid> {
         .collect()
 }
 
+// ------------------------------------------------------------- graph layout --
+
+/// Раскладывает документ-граф в узлы [`Laid`]: у каждого узла свои координаты,
+/// а рёбра превращаются в список родителей.
+fn graph_layout(graph: &GraphDoc, ctx: &egui::Context) -> Vec<Laid> {
+    let mut parents: HashMap<u64, Vec<u64>> = HashMap::new();
+    for edge in &graph.edges {
+        parents.entry(edge.from).or_default().push(edge.to);
+    }
+    graph
+        .nodes
+        .iter()
+        .map(|n| {
+            let depth = if n.root { 0 } else { 1 };
+            let size = node_metrics(&n.text, depth, ctx);
+            Laid {
+                id: n.id,
+                text: n.text.clone(),
+                rect: Rect::from_center_size(Pos2::new(n.x, n.y), size),
+                depth,
+                color: n.color,
+                parents: parents.get(&n.id).cloned().unwrap_or_default(),
+                wrap: false,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------- helpers ---
 
 fn cr(radius: f32) -> CornerRadius {
@@ -756,14 +827,8 @@ fn base_dir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn load_doc(path: &Path) -> Option<Node> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Node>(&text).ok())
-}
-
 /// Читает документ карты любого формата: сначала пробуем свободный холст
-/// (`canvas`), затем обычное дерево.
+/// (`canvas`) или граф (`git-graph`), затем обычное дерево.
 fn load_file(path: &Path) -> Option<Doc> {
     let text = fs::read_to_string(path).ok()?;
     load_file_str(&text)
@@ -776,7 +841,43 @@ fn load_file_str(text: &str) -> Option<Doc> {
     {
         return Some(Doc::Canvas(canvas));
     }
+    if let Ok(graph) = serde_json::from_str::<GraphDoc>(text)
+        && graph.format == GRAPH_FORMAT
+    {
+        return Some(Doc::Graph(graph));
+    }
     serde_json::from_str::<Node>(text).ok().map(Doc::Tree)
+}
+
+/// Превращает граф git-истории в документ карты, присваивая узлам id.
+fn graph_doc_from_view(view: &git::GraphView) -> GraphDoc {
+    let nodes = view
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| GraphNode {
+            id: i as u64 + 1,
+            text: n.text.clone(),
+            x: n.x,
+            y: n.y,
+            color: n.color,
+            root: n.root,
+        })
+        .collect();
+    let edges = view
+        .edges
+        .iter()
+        .map(|&(from, to)| GraphEdge {
+            from: from as u64 + 1,
+            to: to as u64 + 1,
+        })
+        .collect();
+    GraphDoc {
+        format: GRAPH_FORMAT.to_owned(),
+        title: view.title.clone(),
+        nodes,
+        edges,
+    }
 }
 
 fn count_nodes(n: &Node) -> usize {
@@ -800,14 +901,14 @@ fn scan_maps(dir: &Path) -> Vec<MapEntry> {
         let Some(doc) = load_file(&path) else {
             continue;
         };
-        let (title, branches, nodes, canvas) = match doc {
+        let (title, branches, nodes, canvas, graph) = match doc {
             Doc::Tree(node) => {
                 let title = if node.text.trim().is_empty() {
                     "Без названия".to_owned()
                 } else {
                     node.text.clone()
                 };
-                (title, node.children.len(), count_nodes(&node), false)
+                (title, node.children.len(), count_nodes(&node), false, false)
             }
             Doc::Canvas(canvas) => {
                 let title = if canvas.title.trim().is_empty() {
@@ -815,7 +916,22 @@ fn scan_maps(dir: &Path) -> Vec<MapEntry> {
                 } else {
                     canvas.title.clone()
                 };
-                (title, canvas.edges.len(), canvas.nodes.len(), true)
+                (title, canvas.edges.len(), canvas.nodes.len(), true, false)
+            }
+            Doc::Graph(graph) => {
+                let title = if graph.title.trim().is_empty() {
+                    "Без названия".to_owned()
+                } else {
+                    graph.title.clone()
+                };
+                let lanes = graph
+                    .nodes
+                    .iter()
+                    .map(|n| n.color)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                (title, lanes, graph.nodes.len(), false, true)
             }
         };
         out.push(MapEntry {
@@ -824,6 +940,7 @@ fn scan_maps(dir: &Path) -> Vec<MapEntry> {
             branches,
             nodes,
             canvas,
+            graph,
             modified: entry.metadata().ok().and_then(|m| m.modified().ok()),
         });
     }
@@ -1047,26 +1164,35 @@ impl MindMapApp {
 
         // Одноразовый импорт старого mindmap.json в папку карт.
         if !automation && scan_maps(&maps_dir).is_empty() {
-            if let Some(doc) = load_doc(&legacy) {
-                if !doc.text.trim().is_empty() {
-                    let path = new_map_path(&maps_dir);
-                    if let Ok(json) = serde_json::to_string_pretty(&doc) {
-                        let _ = fs::write(&path, json);
+            if let Some(doc) = load_file(&legacy) {
+                let json = match &doc {
+                    Doc::Tree(node) if !node.text.trim().is_empty() => {
+                        serde_json::to_string_pretty(node).ok()
                     }
+                    Doc::Graph(graph) if !graph.title.trim().is_empty() => {
+                        serde_json::to_string_pretty(graph).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(json) = json {
+                    let path = new_map_path(&maps_dir);
+                    let _ = fs::write(&path, json);
                 }
             }
         }
 
-        let (doc, canvas, save_path, save_ok, screen) = if automation {
-            let (doc, canvas, ok) = match load_file(&legacy) {
-                Some(Doc::Tree(node)) if !node.text.trim().is_empty() => (node, None, true),
-                Some(Doc::Canvas(c)) => (canvas_wrapper(&c.title), Some(c), true),
-                _ => (sample_map(), None, false),
+        let (doc, canvas, graph, save_path, save_ok, screen) = if automation {
+            let (doc, canvas, graph, ok) = match load_file(&legacy) {
+                Some(Doc::Tree(node)) if !node.text.trim().is_empty() => (node, None, None, true),
+                Some(Doc::Canvas(c)) => (canvas_wrapper(&c.title), Some(c), None, true),
+                Some(Doc::Graph(g)) => (canvas_wrapper(&g.title), None, Some(g), true),
+                _ => (sample_map(), None, None, false),
             };
-            (doc, canvas, legacy, ok, Screen::Editor)
+            (doc, canvas, graph, legacy, ok, Screen::Editor)
         } else {
             (
                 empty_map(),
+                None,
                 None,
                 maps_dir.join("mindmap.json"),
                 true,
@@ -1087,6 +1213,7 @@ impl MindMapApp {
         let mut app = Self {
             doc,
             canvas,
+            graph,
             next_id,
             selected,
             editing: None,
@@ -1151,16 +1278,26 @@ impl MindMapApp {
         match doc {
             Doc::Tree(node) => {
                 self.canvas = None;
+                self.graph = None;
                 self.doc = node;
             }
             Doc::Canvas(canvas) => {
                 self.doc = canvas_wrapper(&canvas.title);
                 self.canvas = Some(canvas);
+                self.graph = None;
+            }
+            Doc::Graph(graph) => {
+                // Для графа держим `doc` как лёгкую «обёртку» с заголовком,
+                // чтобы верхняя панель и сохранение имени продолжали работать.
+                self.doc = canvas_wrapper(&graph.title);
+                self.graph = Some(graph);
+                self.canvas = None;
             }
         }
-        self.next_id = match &self.canvas {
-            Some(canvas) => canvas.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
-            None => max_id(&self.doc) + 1,
+        self.next_id = match (&self.canvas, &self.graph) {
+            (Some(canvas), _) => canvas.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+            (None, Some(graph)) => graph.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+            (None, None) => max_id(&self.doc) + 1,
         };
         self.selected = match &self.canvas {
             Some(canvas) => canvas.nodes.first().map(|n| n.id).unwrap_or(0),
@@ -1210,6 +1347,15 @@ impl MindMapApp {
                     return;
                 }
             }
+        } else if let Some(graph) = &mut self.graph {
+            graph.title = self.doc.text.clone();
+            match serde_json::to_string_pretty(graph) {
+                Ok(json) => json,
+                Err(_) => {
+                    self.save_ok = false;
+                    return;
+                }
+            }
         } else {
             match serde_json::to_string_pretty(&self.doc) {
                 Ok(json) => json,
@@ -1224,9 +1370,12 @@ impl MindMapApp {
 
     /// Текущее состояние документа в виде снимка для истории отмены.
     fn snapshot(&self) -> Snapshot {
-        match &self.canvas {
-            Some(canvas) => Snapshot::Canvas(canvas.clone()),
-            None => Snapshot::Tree(self.doc.clone()),
+        if let Some(canvas) = &self.canvas {
+            Snapshot::Canvas(canvas.clone())
+        } else if let Some(graph) = &self.graph {
+            Snapshot::Graph(graph.clone())
+        } else {
+            Snapshot::Tree(self.doc.clone())
         }
     }
 
@@ -1234,22 +1383,37 @@ impl MindMapApp {
         match snap {
             Snapshot::Tree(node) => {
                 self.canvas = None;
+                self.graph = None;
                 self.doc = node;
             }
             Snapshot::Canvas(canvas) => {
                 self.doc = canvas_wrapper(&canvas.title);
                 self.canvas = Some(canvas);
+                self.graph = None;
+            }
+            Snapshot::Graph(graph) => {
+                self.doc = canvas_wrapper(&graph.title);
+                self.graph = Some(graph);
+                self.canvas = None;
             }
         }
     }
 
-    /// Раскладка текущего документа: холст, если открыт формат `canvas`,
-    /// иначе обычное дерево.
+    /// Раскладка текущего документа: холст или граф, если открыт
+    /// соответствующий формат, иначе обычное дерево.
     fn current_layout(&self, ctx: &egui::Context) -> Vec<Laid> {
-        match &self.canvas {
-            Some(canvas) => canvas_layout(canvas, ctx),
-            None => build_layout(&self.doc, ctx),
+        if let Some(canvas) = &self.canvas {
+            canvas_layout(canvas, ctx)
+        } else if let Some(graph) = &self.graph {
+            graph_layout(graph, ctx)
+        } else {
+            build_layout(&self.doc, ctx)
         }
+    }
+
+    /// Граф Git доступен только для просмотра: правки в нём не сохраняются.
+    fn read_only(&self) -> bool {
+        self.graph.is_some()
     }
 
     fn push_undo(&mut self) {
@@ -1302,6 +1466,7 @@ impl MindMapApp {
     fn new_map(&mut self) {
         self.doc = empty_map();
         self.canvas = None;
+        self.graph = None;
         self.next_id = 2;
         self.selected = self.doc.id;
         self.editing = None;
@@ -1340,6 +1505,7 @@ impl MindMapApp {
         });
         self.doc = canvas_wrapper(&canvas.title);
         self.canvas = Some(canvas);
+        self.graph = None;
         self.next_id = 2;
         self.selected = 1;
         self.editing = None;
@@ -1358,6 +1524,49 @@ impl MindMapApp {
         self.screen = Screen::Editor;
         self.save();
         self.begin_edit(1);
+    }
+
+    /// Собирает граф по git-истории выбранного репозитория и открывает его.
+    fn import_git(&mut self, ctx: &egui::Context) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Выберите папку git-репозитория")
+            .pick_folder()
+        else {
+            self.toast = Some(("Импорт из Git отменён".to_owned(), Instant::now()));
+            return;
+        };
+
+        let repo = match git::load_repo(&dir) {
+            Ok(repo) => repo,
+            Err(err) => {
+                self.toast = Some((format!("Git: {err}"), Instant::now()));
+                return;
+            }
+        };
+
+        let graph = graph_doc_from_view(&git::build_graph(&repo));
+
+        let path = new_map_path(&self.maps_dir);
+        let json = match serde_json::to_string_pretty(&graph) {
+            Ok(json) => json,
+            Err(_) => {
+                self.toast = Some(("Не удалось собрать карту".to_owned(), Instant::now()));
+                return;
+            }
+        };
+        if let Err(err) = fs::write(&path, json) {
+            self.toast = Some((format!("Не удалось сохранить карту: {err}"), Instant::now()));
+            return;
+        }
+
+        let branches = repo.branches.len();
+        let commits = repo.commits.len();
+        self.open_map(path);
+        self.toast = Some((
+            format!("Граф Git: {branches} веток, {commits} коммитов"),
+            Instant::now(),
+        ));
+        ctx.request_repaint();
     }
 
     fn add_child(&mut self, parent_id: u64) {
@@ -1601,6 +1810,11 @@ impl MindMapApp {
             self.commit_edit();
         }
         match action {
+            Action::AddChild | Action::Delete | Action::Undo | Action::Redo
+                if self.graph.is_some() =>
+            {
+                self.toast = Some(("Граф Git: только просмотр".to_owned(), Instant::now()));
+            }
             Action::AddChild => {
                 let parent = self.selected;
                 self.add_child(parent);
@@ -1748,6 +1962,7 @@ impl MindMapApp {
 
         // Связи между узлами.
         let rects: HashMap<u64, Rect> = layout.iter().map(|l| (l.id, l.rect)).collect();
+        let color_of: HashMap<u64, usize> = layout.iter().map(|l| (l.id, l.color)).collect();
         for laid in &layout {
             if laid.parents.is_empty() {
                 continue;
@@ -1759,9 +1974,37 @@ impl MindMapApp {
                 let Some(parent) = rects.get(&parent_id).copied() else {
                     continue;
                 };
-                let [p0, c1, c2, p3] = edge_curve(parent, child);
+                // Граф использует «плоские» связи по колонкам, холст — изогнутые.
+                let use_graph = self.graph.is_some();
+                let color_index = if use_graph && laid.color == 0 {
+                    color_of.get(&parent_id).copied().unwrap_or(0)
+                } else {
+                    laid.color
+                };
+                let [p0, c1, c2, p3] = if use_graph {
+                    let (p0, p3) = if child.center().x >= parent.center().x {
+                        (
+                            Pos2::new(parent.right() - 1.0, parent.center().y),
+                            Pos2::new(child.left() + 1.0, child.center().y),
+                        )
+                    } else {
+                        (
+                            Pos2::new(parent.left() + 1.0, parent.center().y),
+                            Pos2::new(child.right() - 1.0, child.center().y),
+                        )
+                    };
+                    let dx = (p3.x - p0.x) * 0.55;
+                    [
+                        p0,
+                        Pos2::new(p0.x + dx, p0.y),
+                        Pos2::new(p3.x - dx, p3.y),
+                        p3,
+                    ]
+                } else {
+                    edge_curve(parent, child)
+                };
                 ops.push(PdfOp::SetOutlineColor {
-                    col: pdf_rgb(pal.branch(laid.color)),
+                    col: pdf_rgb(pal.branch(color_index)),
                 });
                 ops.push(PdfOp::SetOutlineThickness {
                     pt: PdfPt((1.8 * scale).max(0.8)),
@@ -1903,6 +2146,15 @@ impl MindMapApp {
             escape = i.consume_key(Modifiers::NONE, Key::Escape);
         });
 
+        if self.read_only() {
+            undo = false;
+            redo = false;
+            add_child = false;
+            add_sibling = false;
+            delete = false;
+            edit = false;
+        }
+
         if undo {
             self.undo();
         }
@@ -1967,6 +2219,7 @@ impl MindMapApp {
 
         let pal = self.pal;
         let is_canvas = self.canvas.is_some();
+        let read_only = self.graph.is_some();
 
         let layout = self.current_layout(ctx);
         if self.needs_fit {
@@ -2043,8 +2296,10 @@ impl MindMapApp {
         }
 
         let mut rects: HashMap<u64, Rect> = HashMap::new();
+        let mut color_of: HashMap<u64, usize> = HashMap::new();
         for laid in &layout {
             rects.insert(laid.id, screen_rect(laid.rect));
+            color_of.insert(laid.id, laid.color);
         }
 
         // Connections.
@@ -2059,10 +2314,39 @@ impl MindMapApp {
                 let Some(pr) = rects.get(&parent_id).copied() else {
                     continue;
                 };
-                let [p0, c1, c2, p3] = edge_curve(pr, cr_);
-                let color = pal.branch(laid.color);
+                // В графе ребро красим цветом ветки: у слияния — цветом
+                // родителя-ветки, у ответвления — цветом ребёнка. Граф рисуем
+                // «плоскими» рёбрами по колонкам, холст — кривыми.
+                let color_index = if read_only && laid.color == 0 {
+                    color_of.get(&parent_id).copied().unwrap_or(0)
+                } else {
+                    laid.color
+                };
+                let color = pal.branch(color_index);
                 let stroke =
                     Stroke::new((2.0 * camera.zoom).clamp(1.1, 2.8), with_alpha(color, 175));
+                let [p0, c1, c2, p3] = if read_only {
+                    let (p0, p3) = if cr_.center().x >= pr.center().x {
+                        (
+                            Pos2::new(pr.right() - 1.0, pr.center().y),
+                            Pos2::new(cr_.left() + 1.0, cr_.center().y),
+                        )
+                    } else {
+                        (
+                            Pos2::new(pr.left() + 1.0, pr.center().y),
+                            Pos2::new(cr_.right() - 1.0, cr_.center().y),
+                        )
+                    };
+                    let dx = (p3.x - p0.x) * 0.55;
+                    [
+                        p0,
+                        Pos2::new(p0.x + dx, p0.y),
+                        Pos2::new(p3.x - dx, p3.y),
+                        p3,
+                    ]
+                } else {
+                    edge_curve(pr, cr_)
+                };
                 let curve = egui::epaint::CubicBezierShape::from_points_stroke(
                     [p0, c1, c2, p3],
                     false,
@@ -2141,10 +2425,10 @@ impl MindMapApp {
             if response.clicked() {
                 self.selected = laid.id;
             }
-            if response.double_clicked() {
+            if response.double_clicked() && !read_only {
                 self.begin_edit(laid.id);
             }
-            if response.drag_started() && !on_handle {
+            if response.drag_started() && !on_handle && !read_only {
                 if is_canvas {
                     self.push_undo();
                     self.resize = None;
@@ -2361,6 +2645,9 @@ impl MindMapApp {
         pointer: Option<Pos2>,
         canvas: Rect,
     ) -> Option<u64> {
+        if self.read_only() {
+            return None;
+        }
         let dragged = self.drag?;
         let pointer = pointer?;
         if !canvas.contains(pointer) {
@@ -2428,7 +2715,7 @@ impl MindMapApp {
             0 => 24.0,
             1 => 20.0,
             _ => 17.0,
-        };
+        } * zoom;
         let clipped = painter.with_clip_rect(rect.shrink(2.0));
         let galley = if laid.wrap {
             let wrap_w = (rect.width() - 2.0 * pad).max(12.0);
@@ -2439,8 +2726,8 @@ impl MindMapApp {
                 wrap_w,
             )
         } else {
-            let max_chars = (((rect.width() - 2.0 * pad) / (size * 0.56)).floor() as usize).max(3);
-            let text = elide(&laid.text, max_chars);
+            let max_w = (rect.width() - pad * 2.0).max(8.0);
+            let text = elide_to_width(painter.ctx(), &laid.text, size, max_w);
             clipped.layout_no_wrap(text, FontId::proportional(size), text_color)
         };
         clipped.galley(rect.center() - galley.size() * 0.5, galley, text_color);
@@ -2591,6 +2878,7 @@ impl MindMapApp {
         let mut toggle = false;
         let mut make_new = false;
         let mut make_canvas = false;
+        let mut import_git = false;
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.canvas))
@@ -2641,7 +2929,7 @@ impl MindMapApp {
                             ui.add_space(20.0);
                             let btn_w = 176.0;
                             let pad =
-                                ((ui.available_width() - (btn_w * 2.0 + 10.0)) * 0.5).max(0.0);
+                                ((ui.available_width() - (btn_w * 3.0 + 20.0)) * 0.5).max(0.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(pad);
                                 if pill_button(
@@ -2665,7 +2953,26 @@ impl MindMapApp {
                                 ) {
                                     make_canvas = true;
                                 }
+                                ui.add_space(10.0);
+                                if pill_button(
+                                    ui,
+                                    &pal,
+                                    "+ Из Git…",
+                                    false,
+                                    btn_w,
+                                    "Собрать карту из истории репозитория",
+                                ) {
+                                    import_git = true;
+                                }
                             });
+                            if let Some((msg, at)) = &self.toast {
+                                if at.elapsed().as_secs_f32() < 6.0 {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(msg.clone()).size(12.0).color(pal.muted),
+                                    );
+                                }
+                            }
                             ui.add_space(22.0);
 
                             Frame::new()
@@ -2721,6 +3028,9 @@ impl MindMapApp {
         if toggle {
             self.toggle_theme(ctx);
         }
+        if import_git {
+            self.import_git(ctx);
+        }
         if make_new {
             self.new_map();
         }
@@ -2741,23 +3051,28 @@ impl MindMapApp {
         let mut actions: Vec<Action> = Vec::new();
         let pal = self.pal;
         let is_canvas = self.canvas.is_some();
-        let can_undo = !self.undo_stack.is_empty();
-        let can_redo = !self.redo_stack.is_empty();
+        let read_only = self.read_only();
+        let can_undo = !read_only && !self.undo_stack.is_empty();
+        let can_redo = !read_only && !self.redo_stack.is_empty();
         let can_delete = if is_canvas {
             self.canvas
                 .as_ref()
                 .map(|c| c.nodes.iter().any(|n| n.id == self.selected))
                 .unwrap_or(false)
         } else {
-            self.selected != self.doc.id
+            !read_only && self.selected != self.doc.id
         };
         let title = elide(&self.doc.text, 42);
         let kind = if is_canvas {
             "Свободный холст"
+        } else if read_only {
+            "Граф Git"
         } else {
             "Простая карта"
         };
-        let default_subtitle = if self.save_ok {
+        let default_subtitle = if read_only {
+            "Граф Git · только просмотр".to_owned()
+        } else if self.save_ok {
             format!("{kind} · сохранено")
         } else {
             format!("{kind} · сохранение недоступно")
@@ -2816,9 +3131,16 @@ impl MindMapApp {
                             {
                                 actions.push(Action::AddNode);
                             }
-                        } else if pill_button(ui, &pal, "+ Ветка", true, 102.0, "Добавить ветку (Tab)")
-                        {
-                            actions.push(Action::AddChild);
+                        } else {
+                            let branch_tip = if read_only {
+                                "Недоступно: граф Git только для просмотра"
+                            } else {
+                                "Добавить ветку (Tab)"
+                            };
+                            if pill_button(ui, &pal, "+ Ветка", !read_only, 102.0, branch_tip)
+                            {
+                                actions.push(Action::AddChild);
+                            }
                         }
                         if pill_button(ui, &pal, "Новая", false, 74.0, "Новая карта (Cmd+N)") {
                             actions.push(Action::NewMap);
@@ -2874,10 +3196,11 @@ impl MindMapApp {
         let zoom = self.camera.zoom;
         let hint = if self.canvas.is_some() {
             "Перетащите узел · угол — размер · «Связь» — соединить · Tab — узел · двойной клик — текст · Delete — узел"
+        } else if self.read_only() {
+            "Граф Git · только просмотр · колесо — зум · F — по размеру · Cmd+P — PDF"
         } else {
             "Tab — ветка · Enter — ещё одна · Delete — удалить · двойной клик — изменить · Cmd+P — PDF"
         };
-        let _ = ctx;
 
         egui::Panel::bottom("bottom_bar")
             .exact_size(38.0)
@@ -3047,6 +3370,12 @@ fn map_row(ui: &mut egui::Ui, pal: &Palette, entry: &MapEntry) -> RowAction {
     let sub = if entry.canvas {
         format!(
             "Свободный холст · {} · изменено {}",
+            nodes_label(entry.nodes),
+            relative_time(entry.modified)
+        )
+    } else if entry.graph {
+        format!(
+            "граф Git · {} · изменено {}",
             nodes_label(entry.nodes),
             relative_time(entry.modified)
         )
@@ -3399,7 +3728,7 @@ mod tests {
                 assert_eq!(restored.nodes[1].w, 140.0);
                 assert_eq!(restored.title, "Чистый лист");
             }
-            Doc::Tree(_) => panic!("ожидался свободный холст"),
+            _ => panic!("ожидался свободный холст"),
         }
     }
 
@@ -3417,5 +3746,44 @@ mod tests {
         assert!(p0.x > a.center().x);
         assert!(p3.x < b.center().x);
         assert!((p0.y - a.center().y).abs() < 0.001);
+    }
+
+    #[test]
+    fn serde_roundtrip_keeps_graph() {
+        let graph = GraphDoc {
+            format: GRAPH_FORMAT.to_owned(),
+            title: "demo".to_owned(),
+            nodes: vec![
+                GraphNode {
+                    id: 1,
+                    text: "demo".to_owned(),
+                    x: 0.0,
+                    y: 0.0,
+                    color: 0,
+                    root: true,
+                },
+                GraphNode {
+                    id: 2,
+                    text: "abc1234 start".to_owned(),
+                    x: 320.0,
+                    y: 0.0,
+                    color: 0,
+                    root: false,
+                },
+            ],
+            edges: vec![GraphEdge { from: 2, to: 1 }],
+        };
+        let text = serde_json::to_string(&graph).unwrap();
+        match load_file_str(&text) {
+            Some(Doc::Graph(restored)) => {
+                assert_eq!(restored.nodes.len(), 2);
+                assert!(restored.nodes[0].root);
+                assert_eq!(restored.edges[0].from, 2);
+            }
+            _ => panic!("граф не распознан"),
+        }
+        // обычное дерево не должно распознаваться как граф
+        let tree = serde_json::to_string(&sample_map()).unwrap();
+        assert!(matches!(load_file_str(&tree), Some(Doc::Tree(_))));
     }
 }
