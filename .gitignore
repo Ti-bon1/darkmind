@@ -1,2 +1,19 @@
+# Rust
 /target
-craft.json, feed.json, usage.json, inbox/, build-activity.log, shots/, capture/, investigation.cany/, .DS_Store, и лишний src/settings.json.
+
+# macOS
+.DS_Store
+
+# Служебные файлы сборщика (агента)
+craft.json
+feed.json
+usage.json
+inbox/
+build-activity.log
+investigation.cany/
+capture/
+shots/
+
+# Личные данные приложения
+/maps/
+/settings.json
